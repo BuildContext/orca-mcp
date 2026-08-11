@@ -1,0 +1,13 @@
+# Optional: copy to /etc/logrotate.d/orca-bridge when using run.sh file logs.
+# Under systemd, prefer journald (no file rotation needed).
+/var/log/orca-bridge/*.log
+/home/*/bridge-vm/logs/bridge.log
+{
+  weekly
+  rotate 8
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}

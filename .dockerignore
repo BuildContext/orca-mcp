@@ -1,0 +1,34 @@
+# VCS / IDE
+.git
+.github
+.idea
+.vscode
+*.swp
+*~
+
+# Secrets and local runtime state — never bake these in
+.env
+.env.*
+!**/.env.example
+**/.orca-bridge*
+**/.orca-bridge/
+**/env
+!**/env.example
+*.pem
+*.key
+*.local
+
+# Dependencies and logs
+node_modules
+npm-debug.log*
+*.log
+*.tgz
+
+# Tests / CI noise (runtime does not need *.test.mjs, but lib/ is small;
+# keep tests out of the image to shrink attack surface slightly)
+**/*.test.mjs
+coverage
+.nyc_output
+
+# OS
+.DS_Store

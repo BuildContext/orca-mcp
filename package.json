@@ -1,0 +1,53 @@
+{
+  "name": "orca-mcp",
+  "version": "0.2.13",
+  "private": true,
+  "description": "External MCP server for controlling Orca (worktrees, sessions, orchestration)",
+  "type": "module",
+  "mcpName": "io.github.buildcontext/orca-mcp",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "orca-mcp": "./server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs --port 8787",
+    "start:stdio": "node server.mjs --stdio",
+    "test": "node --test lib/*.test.mjs",
+    "lint": "node scripts/lint.mjs",
+    "docs:build": "node scripts/docs.mjs build",
+    "docs:check": "node scripts/docs.mjs check",
+    "prepack": "npm test && npm run lint && npm run docs:check"
+  },
+  "keywords": [
+    "orca",
+    "mcp",
+    "model-context-protocol",
+    "agent",
+    "orchestration",
+    "worktree"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BuildContext/orca-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/BuildContext/orca-mcp/issues"
+  },
+  "homepage": "https://github.com/BuildContext/orca-mcp#readme",
+  "license": "MIT",
+  "files": [
+    "server.mjs",
+    "lib/",
+    "scripts/",
+    "docs/",
+    "COORDINATOR.md",
+    "deploy/",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "server.json"
+  ]
+}

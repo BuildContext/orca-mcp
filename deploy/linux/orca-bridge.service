@@ -1,0 +1,27 @@
+[Unit]
+Description=orca-mcp — external MCP server for Orca
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Edit User/Group/paths for your host.
+User=orca
+Group=orca
+WorkingDirectory=/opt/orca-mcp
+Environment=HOME=/home/USER
+Environment=PATH=/home/USER/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Plain KEY=VALUE env file (mode 600). Token/origin stay on the host, not in git.
+EnvironmentFile=/etc/orca-mcp/env
+# Long-running node directly — not run.sh/nohup (those exit after start).
+ExecStart=/usr/bin/node /opt/orca-mcp/server.mjs --port 8787
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orca-bridge
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

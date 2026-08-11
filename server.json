@@ -1,0 +1,95 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.buildcontext/orca-mcp",
+  "title": "orca-mcp",
+  "description": "MCP bridge controlling Orca worktrees, sessions, and multi-agent orchestration.",
+  "repository": {
+    "url": "https://github.com/BuildContext/orca-mcp",
+    "source": "github"
+  },
+  "version": "0.2.13",
+  "websiteUrl": "https://github.com/BuildContext/orca-mcp",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "orca-mcp",
+      "version": "0.2.13",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "--stdio"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "ORCA_BRIDGE_TOKEN",
+          "description": "Master bridge token (\u226516 chars). Required. Auth for stdio hosts and HTTP path-token/OAuth password.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "ORCA_CLI_COMMAND",
+          "description": "Override path/name of the Orca CLI binary (default: orca; Linux headless often orca-ide).",
+          "isRequired": false
+        },
+        {
+          "name": "ORCA_BRIDGE_DEFAULT_REPO",
+          "description": "Default --repo for dispatch (path:/\u2026 or name:\u2026).",
+          "isRequired": false
+        },
+        {
+          "name": "ORCA_BRIDGE_TOOLSETS",
+          "description": "Comma-separated capability tiers to enable (status,dispatch,admin). Default: all enabled.",
+          "isRequired": false
+        },
+        {
+          "name": "ORCA_BRIDGE_CLI_HARDENING",
+          "description": "Set to 1 to enforce the CLI action allowlist (recommended on shared hosts).",
+          "isRequired": false
+        }
+      ]
+    },
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/buildcontext/orca-mcp:0.2.13",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--rm",
+          "description": "Remove container after exit (typical for stdio MCP hosts)."
+        },
+        {
+          "type": "named",
+          "name": "-i",
+          "description": "Keep stdin open for MCP JSON-RPC."
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "--stdio"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "ORCA_BRIDGE_TOKEN",
+          "description": "Master bridge token (\u226516 chars). Required.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "ORCA_CLI_COMMAND",
+          "description": "Override path/name of the Orca CLI binary inside the container network/namespace.",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

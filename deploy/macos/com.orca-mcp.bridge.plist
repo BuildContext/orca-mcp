@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Mac LaunchAgent for orca-mcp.
+
+  install-mac.sh rewrites HOME paths to the installing user before
+  installing into ~/Library/LaunchAgents/.
+  Secrets are NOT in this file — start.sh sources ~/.orca-bridge/env (mode 600).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.orca-mcp.bridge</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>__HOME__/.orca-bridge/start.sh</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>__HOME__/.orca-bridge</string>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+
+	<key>StandardOutPath</key>
+	<string>__HOME__/.orca-bridge/logs/launchd.stdout.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.orca-bridge/logs/launchd.stderr.log</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+	</dict>
+</dict>
+</plist>

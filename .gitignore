@@ -1,0 +1,22 @@
+# secrets / runtime state (never commit)
+.env
+.env.*
+!.env.example
+**/env
+!**/env.example
+.orca-bridge/
+*.pem
+*.key
+
+# node / OS
+node_modules/
+.DS_Store
+*.log
+npm-debug.log*
+.idea/
+.vscode/
+*.swp
+*~
+
+# local override
+*.local

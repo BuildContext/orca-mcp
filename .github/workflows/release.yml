@@ -1,0 +1,242 @@
+# Publish orca-mcp to npm (with provenance) and GHCR on version tags.
+#
+# Trigger:
+#   git tag v0.2.13 && git push origin v0.2.13
+#   — or workflow_dispatch with the same tag name.
+#
+# Required repo secrets:
+#   NPM_TOKEN — automation token with publish rights on the `orca-mcp` package
+#
+# Permissions:
+#   id-token: write  → npm provenance (sigstore)
+#   contents: write  → GitHub Release notes
+#   packages: write  → GHCR push
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag already on the default branch tip (e.g. v0.2.13). Leave empty when triggered by push.'
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install
+        run: npm install --ignore-scripts
+
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Docs check
+        run: npm run docs:check
+
+      - name: Pack dry-run
+        run: |
+          npm pack --dry-run 2>&1 | tee /tmp/pack-dry.txt
+          # Fail closed if anything secret-looking lands in the tarball listing.
+          if grep -E '\.env($|\.)|node_modules|\.orca-bridge|id_rsa|\.pem($|\.)' /tmp/pack-dry.txt; then
+            echo "::error::pack listing contains forbidden paths"
+            exit 1
+          fi
+
+  npm-publish:
+    name: npm publish (provenance)
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          # scope not needed for unscoped package; registry-url still enables auth
+
+      - name: Install
+        run: npm install --ignore-scripts
+
+      - name: Assert package version matches tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          case "$TAG" in
+            v*) EXPECTED="${TAG#v}" ;;
+            *) echo "::error::tag must look like vX.Y.Z (got $TAG)"; exit 1 ;;
+          esac
+          PKG="$(node -p 'require("./package.json").version')"
+          if [ "$PKG" != "$EXPECTED" ]; then
+            echo "::error::package.json version ($PKG) != tag version ($EXPECTED)"
+            exit 1
+          fi
+          echo "Publishing orca-mcp@$PKG from tag $TAG"
+
+      - name: Publish to npm with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+  ghcr:
+    name: GHCR image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/buildcontext/orca-mcp" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ver.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=latest
+            type=sha,format=long
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.ver.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  github-release:
+    name: GitHub Release
+    needs: [npm-publish, ghcr]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          VERSION="${{ steps.ver.outputs.version }}"
+          BODY="$(cat <<EOF
+          ## orca-mcp ${VERSION}
+
+          Bridge version stays coupled to the npm package version (\`${VERSION}\`).
+
+          ### Install
+
+          \`\`\`bash
+          # stdio (local MCP hosts) — pin the version
+          npx -y orca-mcp@${VERSION} --stdio
+
+          # container (preferred for privileged/long-lived hosts)
+          docker run --rm -i \\
+            -e ORCA_BRIDGE_TOKEN="\$ORCA_BRIDGE_TOKEN" \\
+            ghcr.io/buildcontext/orca-mcp:${VERSION} --stdio
+          \`\`\`
+
+          ### Artifacts
+
+          - npm: https://www.npmjs.com/package/orca-mcp/v/${VERSION}
+          - GHCR: \`ghcr.io/buildcontext/orca-mcp:${VERSION}\`
+          - MCP Registry name: \`io.github.buildcontext/orca-mcp\`
+
+          ### Notes
+
+          - Published to npm **with provenance** (\`npm publish --provenance\`).
+          - Image runs as non-root UID 1001; no secrets baked in.
+          - Read [SECURITY.md](https://github.com/BuildContext/orca-mcp/blob/main/SECURITY.md) before exposing the bridge.
+          EOF
+          )"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$BODY"
+          else
+            gh release create "$TAG" --title "orca-mcp ${VERSION}" --notes "$BODY"
+          fi
