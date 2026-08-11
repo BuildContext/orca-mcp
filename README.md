@@ -112,9 +112,35 @@ Current bridge version: **0.2.13** (see `VERSION` in `server.mjs`).
 
 Desktop MCP hosts (Claude Desktop, Cursor, VS Code, Windsurf, Claude Code) launch the bridge as a **subprocess** and speak **newline-delimited JSON-RPC** on stdin/stdout. No browser OAuth — secrets come from the environment (MCP guidance for stdio servers).
 
-Published package: **`orca-mcp@0.2.13`** on npm (pin the version; `@latest` is fine for throwaways only). Prefer the [container image](#container-ghcr) for long-lived or privileged hosts.
+**Install today from git / a local checkout** (the npm package is not published yet — `npx orca-mcp` will 404 until the first release). Prefer the [container image](#container-ghcr) for long-lived or privileged hosts once GHCR tags exist; until then build the `Dockerfile` locally.
 
-### Standard config
+### Standard config (local checkout)
+
+```json
+{
+  "mcpServers": {
+    "orca": {
+      "command": "node",
+      "args": ["/absolute/path/to/orca-mcp/server.mjs", "--stdio"],
+      "env": {
+        "ORCA_BRIDGE_TOKEN": "<openssl rand -hex 32>",
+        "ORCA_CLI_COMMAND": "orca"
+      }
+    }
+  }
+}
+```
+
+Clone first if needed:
+
+```bash
+git clone https://github.com/BuildContext/orca-mcp.git
+# zero runtime dependencies — no npm install required to run
+```
+
+### Soon: npm package
+
+After the first npm publish, the same host configs can switch to the registry package (pin the version; `@latest` is fine for throwaways only):
 
 ```json
 {
@@ -131,22 +157,6 @@ Published package: **`orca-mcp@0.2.13`** on npm (pin the version; `@latest` is f
 }
 ```
 
-Local checkout (no registry):
-
-```json
-{
-  "mcpServers": {
-    "orca": {
-      "command": "node",
-      "args": ["/absolute/path/to/orca-mcp/server.mjs", "--stdio"],
-      "env": {
-        "ORCA_BRIDGE_TOKEN": "<openssl rand -hex 32>"
-      }
-    }
-  }
-}
-```
-
 ### Host matrix
 
 <details>
@@ -157,7 +167,7 @@ Edit the desktop config and restart Claude Desktop:
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
-Use the **Standard config** JSON above (`mcpServers.orca`).
+Use the **Standard config (local checkout)** JSON above (`mcpServers.orca`).
 
 </details>
 
@@ -165,11 +175,11 @@ Use the **Standard config** JSON above (`mcpServers.orca`).
 <summary>Claude Code</summary>
 
 ```bash
-# Published package (pin the version):
-claude mcp add orca --env ORCA_BRIDGE_TOKEN=… -- npx -y orca-mcp@0.2.13 --stdio
-
-# Local checkout:
+# Local checkout (works today):
 claude mcp add orca --env ORCA_BRIDGE_TOKEN=… -- node /absolute/path/to/orca-mcp/server.mjs --stdio
+
+# After npm publish (pin the version):
+claude mcp add orca --env ORCA_BRIDGE_TOKEN=… -- npx -y orca-mcp@0.2.13 --stdio
 ```
 
 </details>
@@ -179,11 +189,11 @@ claude mcp add orca --env ORCA_BRIDGE_TOKEN=… -- node /absolute/path/to/orca-m
 
 **Cursor Settings → MCP → Add new MCP Server**, command type:
 
-- Command: `npx`
-- Args: `-y orca-mcp@0.2.13 --stdio`
+- Command: `node`
+- Args: `/absolute/path/to/orca-mcp/server.mjs --stdio`
 - Env: `ORCA_BRIDGE_TOKEN`, optional `ORCA_CLI_COMMAND`
 
-Or merge the **Standard config** into Cursor’s MCP JSON.
+Or merge the **Standard config (local checkout)** into Cursor’s MCP JSON. After npm publish you can switch to `npx` + `orca-mcp@0.2.13` as in the “Soon: npm package” example.
 
 </details>
 
@@ -191,8 +201,11 @@ Or merge the **Standard config** into Cursor’s MCP JSON.
 <summary>VS Code</summary>
 
 ```bash
-# Published package (VS Code 1.102+ MCP support):
-code --add-mcp '{"name":"orca","command":"npx","args":["-y","orca-mcp@0.2.13","--stdio"],"env":{"ORCA_BRIDGE_TOKEN":"<token>"}}'
+# Local checkout (VS Code 1.102+ MCP support):
+code --add-mcp '{"name":"orca","command":"node","args":["/absolute/path/to/orca-mcp/server.mjs","--stdio"],"env":{"ORCA_BRIDGE_TOKEN":"<token>"}}'
+
+# After npm publish:
+# code --add-mcp '{"name":"orca","command":"npx","args":["-y","orca-mcp@0.2.13","--stdio"],"env":{"ORCA_BRIDGE_TOKEN":"<token>"}}'
 ```
 
 Or add the same object under `"mcp": { "servers": { … } }` in `.vscode/mcp.json` / user `settings.json` (see current VS Code MCP docs for the exact key — it has moved between preview builds).
@@ -230,15 +243,16 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  | npx -y orca-mcp@0.2.13 --stdio
+  | node /absolute/path/to/orca-mcp/server.mjs --stdio
 # Expect two JSON-RPC response lines on stdout (initialize + tools/list); banners on stderr only.
+# After npm publish you can substitute: npx -y orca-mcp@0.2.13 --stdio
 ```
 
 ---
 
 ## Container (GHCR)
 
-Docker's guidance for privileged MCP servers is **container over bare `npx`**. The published image runs as non-root UID 1001, bakes no secrets, and the same entrypoint supports HTTP and stdio.
+Docker's guidance for privileged MCP servers is **container over bare registry installs**. The published image runs as non-root UID 1001, bakes no secrets, and the same entrypoint supports HTTP and stdio.
 
 ```bash
 # pin by semver
@@ -279,16 +293,16 @@ MCP Registry metadata lives in [`server.json`](./server.json) (`io.github.buildc
 - A secret master token (≥ 16 chars)
 
 ```bash
-# From npm (HTTP mode):
+# From a git checkout (works today):
+git clone https://github.com/BuildContext/orca-mcp.git
+cd orca-mcp
 export ORCA_BRIDGE_TOKEN="$(openssl rand -hex 32)"
 echo "Save this token: $ORCA_BRIDGE_TOKEN"
 export ORCA_BRIDGE_PUBLIC_ORIGIN="https://your-host.example.ts.net"   # optional; needed for OAuth URLs
-npx -y orca-mcp@0.2.13 --port 8787
-
-# Or from a git checkout:
-git clone https://github.com/BuildContext/orca-mcp.git
-cd orca-mcp
 node server.mjs --port 8787
+
+# After npm publish (HTTP mode):
+# npx -y orca-mcp@0.2.13 --port 8787
 ```
 
 The server binds **127.0.0.1 only**. Publish it yourself:

@@ -1,0 +1,30 @@
+# Private scrub denylist for scripts/preflight-release.sh
+#
+# Copy to a private path and point SCRUB_DENYLIST_FILE at it, e.g.:
+#   cp scripts/scrub-denylist.example scripts/scrub-denylist.local
+#   export SCRUB_DENYLIST_FILE="$PWD/scripts/scrub-denylist.local"
+#
+# scripts/scrub-denylist.local is gitignored. Do NOT commit real markers.
+# One extended-regex fragment per line. Blank lines and # comments are ignored.
+# Fragments are joined with | and passed to `git grep -E`.
+#
+# Neutral examples only — replace with your own deployment-specific patterns:
+
+# Organization or product codenames
+acme-corp
+acme_internal
+
+# Internal hostnames / VPN DNS
+internal\.example\.com
+staging\.example\.corp
+
+# Issue tracker prefixes (org-specific; universal [A-Z]{2,}-[0-9]+ is already in-script)
+JIRA-
+ACME-
+
+# Machine-local home paths / builder users
+/home/builduser
+/Users/builduser
+
+# Optional: other host-local path fragments
+# /var/lib/acme/

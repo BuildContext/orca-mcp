@@ -78,12 +78,101 @@ else
 fi
 
 # ── scrub (host-local / private markers) ──────────────────────────────────
-SCRUB_RE='REDACTED_PRIVATE_PATTERN'
-if git grep -nI -E "$SCRUB_RE" -- . ':(exclude)scripts/preflight-release.sh' >/tmp/orca-preflight-scrub.txt 2>/dev/null; then
+# Universal patterns only — no deployment-specific names, hosts, or people.
+# Org-private patterns live outside the repo: set SCRUB_DENYLIST_FILE to a
+# newline-separated list of extended-regex fragments (comments/blank OK).
+# See scripts/scrub-denylist.example.
+SCRUB_DENYLIST_FILE="${SCRUB_DENYLIST_FILE:-}"
+SCRUB_EXCLUDE=(
+  ':(exclude)scripts/preflight-release.sh'
+  ':(exclude)scripts/scrub-denylist.example'
+  ':(exclude)scripts/scrub-denylist.local'
+  ':(exclude).gitignore'
+)
+# Public ID schemes that match the generic tracker token shape — not scrub hits.
+SCRUB_PUBLIC_ID_RE='^(CVE|CWE|SHA|UTF|RFC|ISO|IEC|HTML|HTTP|HTTPS|JSON|TLS|TCP|UDP|PNG|SVG|CSS|XML|AWS|GCP)-'
+
+SCRUB_PATTERNS=()
+# Cyrillic (often accidental local-language leaks in an English-primary tree)
+SCRUB_PATTERNS+=('[А-Яа-яЁё]')
+# Email addresses
+SCRUB_PATTERNS+=('[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+# Private IPv4 ranges (approx.)
+SCRUB_PATTERNS+=('\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b')
+SCRUB_PATTERNS+=('\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b')
+SCRUB_PATTERNS+=('\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b')
+# Generic issue/tracker tokens (ORG-123). Public CVE/SHA/… filtered below.
+SCRUB_PATTERNS+=('[A-Z]{2,}-[0-9]+')
+
+if [[ -n "$SCRUB_DENYLIST_FILE" ]]; then
+  if [[ -f "$SCRUB_DENYLIST_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      # trim, skip blanks and full-line comments
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      SCRUB_PATTERNS+=("$line")
+    done < "$SCRUB_DENYLIST_FILE"
+    pass "scrub denylist loaded (${#SCRUB_PATTERNS[@]} patterns, file: $SCRUB_DENYLIST_FILE)"
+  else
+    warn "SCRUB_DENYLIST_FILE set but not found: $SCRUB_DENYLIST_FILE — universal patterns only"
+  fi
+else
+  # Default path next to the example (gitignored); load if present.
+  _default_denylist="$ROOT/scripts/scrub-denylist.local"
+  if [[ -f "$_default_denylist" ]]; then
+    SCRUB_DENYLIST_FILE="$_default_denylist"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      SCRUB_PATTERNS+=("$line")
+    done < "$SCRUB_DENYLIST_FILE"
+    pass "scrub denylist loaded (${#SCRUB_PATTERNS[@]} patterns, file: $SCRUB_DENYLIST_FILE)"
+  else
+    warn "no SCRUB_DENYLIST_FILE — scrubbing with universal patterns only (see scripts/scrub-denylist.example)" >&2
+  fi
+fi
+
+# Join patterns for git-grep -E (extended regex alternation).
+SCRUB_RE="$(printf '%s\n' "${SCRUB_PATTERNS[@]}" | paste -sd'|' -)"
+: > /tmp/orca-preflight-scrub.txt
+if [[ -n "$SCRUB_RE" ]]; then
+  # git grep exits 1 when there are no matches — not a failure here.
+  git grep -nI -E "$SCRUB_RE" -- . "${SCRUB_EXCLUDE[@]}" \
+    >/tmp/orca-preflight-scrub.raw 2>/dev/null || true
+  if [[ -s /tmp/orca-preflight-scrub.raw ]]; then
+    # Drop lines whose only tracker-shaped tokens are well-known public IDs
+    # (CVE-…, SHA-256, UTF-8, …). Keep any line that still matches SCRUB_RE
+    # after those tokens are blanked.
+    SCRUB_RE="$SCRUB_RE" SCRUB_PUBLIC_ID_RE="$SCRUB_PUBLIC_ID_RE" node <<'NODE' \
+      >/tmp/orca-preflight-scrub.txt
+const fs = require('fs');
+const scrubRe = new RegExp(process.env.SCRUB_RE, 'g');
+const publicId = new RegExp(process.env.SCRUB_PUBLIC_ID_RE);
+const raw = fs.readFileSync('/tmp/orca-preflight-scrub.raw', 'utf8');
+for (const line of raw.split(/\n')) {
+  if (!line) continue;
+  // git grep -nI → path:line:content — blank public IDs in the content only
+  const m = line.match(/^(.*?:\d+:)(.*)$/);
+  const body = m ? m[2] : line;
+  const stripped = body.replace(scrubRe, (tok) => (publicId.test(tok) ? '' : tok));
+  scrubRe.lastIndex = 0;
+  if (scrubRe.test(stripped)) {
+    scrubRe.lastIndex = 0;
+    process.stdout.write(line + '\n');
+  }
+  scrubRe.lastIndex = 0;
+}
+NODE
+  fi
+fi
+
+if [[ -s /tmp/orca-preflight-scrub.txt ]]; then
   fail "scrub hits in tree:"
   sed 's/^/    /' /tmp/orca-preflight-scrub.txt || true
 else
-  pass "scrub-grep clean (host paths / private markers)"
+  pass "scrub-grep clean (universal + optional private denylist)"
 fi
 
 # ── git / remote ──────────────────────────────────────────────────────────
@@ -174,7 +263,7 @@ if _docker info >/dev/null 2>&1; then
   fi
 else
   warn "docker unavailable or no permission (sock) — skip image build; GHCR job will build in Actions"
-  note "  fix: sudo usermod -aG docker \"\$USER\" && newgrp docker   # or: sg docker -c 'docker …'"
+  warn "  fix: sudo usermod -aG docker \"\$USER\" && newgrp docker   # or: sg docker -c 'docker …'"
 fi
 
 printf '\n'

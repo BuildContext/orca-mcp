@@ -20,3 +20,7 @@ npm-debug.log*
 
 # local override
 *.local
+
+# private release scrub patterns (never commit real markers)
+scripts/scrub-denylist.local
+scrub-denylist.local
