@@ -92,7 +92,7 @@ Prefer extracting pure helpers into `lib/` with unit tests over growing insepara
 
 - **One concern per PR** when practical; link the related issue/ticket when one exists.
 - Describe **behavior change** and **risk** in the PR body (especially anything auth-, spawn-, or CLI-related).
-- Do not bump version / tag / publish unless that is the ticket. `package.json` `"private": true` stays until the publish track says otherwise.
+- Do not bump version / tag / publish unless that is the ticket. Before a release tag, run `npm run preflight` (see `scripts/preflight-release.sh`).
 - Do not commit secrets, real `ORCA_BRIDGE_TOKEN` values, or live paths with credentials.
 - Match existing style: ESM (`.mjs`), no new runtime npm dependencies unless there is a strong, discussed reason (project norm is **zero** runtime deps).
 
