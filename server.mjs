@@ -73,6 +73,18 @@ import {
   buildWaitMsPropertyDescription,
 } from './lib/coordinator-doctrine.mjs';
 import {
+  versionGte,
+  RuntimeGuardError,
+  createRuntimeProbeCache,
+  assertRuntimeReady,
+  compactHealthPayload,
+  computeLiveness,
+  nextStepForLiveness,
+  pickLastActivityAt,
+} from './lib/runtime-guard.mjs';
+
+
+import {
   ORCA_TOOL_ANNOTATIONS,
   ACTION_ANNOTATIONS,
   ORCA_OUTPUT_SCHEMA,
@@ -284,22 +296,8 @@ function withWorkerContract(spec) {
 }
 
 
-function parseSemver(v) {
-  const m = String(v || '').trim().match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (!m) return null;
-  return [Number(m[1]), Number(m[2]), Number(m[3])];
-}
+// versionGte / parseSemver live in lib/runtime-guard.mjs (unit-tested).
 
-function versionGte(a, b) {
-  const pa = parseSemver(a);
-  const pb = parseSemver(b);
-  if (!pa || !pb) return false;
-  for (let i = 0; i < 3; i++) {
-    if (pa[i] > pb[i]) return true;
-    if (pa[i] < pb[i]) return false;
-  }
-  return true;
-}
 
 /** Long discipline docs for coordinators (also generated into COORDINATOR.md). */
 function coordinatorGuide() {
@@ -319,6 +317,9 @@ if (!TOKEN || TOKEN.length < 16) {
 }
 const HINDSIGHT_URL = new URL(process.env.HINDSIGHT_URL || 'http://127.0.0.1:8888');
 const startedAt = Date.now();
+/** Lazy runtime probe cache (NAS-246) — TTL'd status for dispatch/await/release. */
+const runtimeProbeCache = createRuntimeProbeCache();
+
 
 // Public origin for OAuth discovery/endpoints. Set to the Funnel host.
 // When unset, endpoints are built from the request Host header.
@@ -493,6 +494,47 @@ function describeRun(run, wantJson) {
   return out;
 }
 
+/**
+ * Lazy runtime/version gate for dispatch/await/release (NAS-246).
+ * Uses TTL cache so waves do not re-probe every call.
+ * Throws RuntimeGuardError with code/reason/recovery.
+ */
+async function ensureRuntimeReady({ force = false } = {}) {
+  // Bridge process version is local — always check, no I/O.
+  assertRuntimeReady({ version: VERSION, minVersion: MIN_BRIDGE_VERSION });
+
+  if (!force) {
+    const cached = runtimeProbeCache.get();
+    if (cached) {
+      assertRuntimeReady({ version: VERSION, minVersion: MIN_BRIDGE_VERSION, probe: cached });
+      return cached;
+    }
+  }
+
+  const run = await runOrca(['status', '--json'], { timeoutMs: 15_000 });
+  const probe = describeRun(run, true);
+  // Cache both success and failure briefly so a dead runtime does not stampede.
+  runtimeProbeCache.set(probe);
+  assertRuntimeReady({ version: VERSION, minVersion: MIN_BRIDGE_VERSION, probe });
+  return probe;
+}
+
+/** Best-effort map RuntimeGuardError (or unknown) to a structured tool result. */
+function runtimeGuardRejection(err) {
+  if (err instanceof RuntimeGuardError) return err.toJSON();
+  return {
+    ok: false,
+    error: {
+      code: 'runtime_unavailable',
+      message: String(err?.message || err),
+      reason: String(err?.message || err),
+      recovery: 'Retry once; if it persists, run action=health and ask the owner to check the orca daemon.',
+    },
+    next: { action: 'diagnose', detail: 'Unexpected runtime error before supervised action.' },
+  };
+}
+
+
 // --- Helpers: orchestration envelopes ---------------------------------------
 function envOk(described) {
   return described && described.ok === true && described.envelope;
@@ -561,7 +603,7 @@ function summarizeMessages(messages = []) {
   };
 }
 
-function nextStepForAwait(summary, { timedOut, deliveryId }) {
+function nextStepForAwait(summary, { timedOut, deliveryId, livenessInfo = null } = {}) {
   // next.action is a HINT — summary.status wins if they disagree.
   if (summary.status === 'worker_done') {
     return {
@@ -599,14 +641,15 @@ function nextStepForAwait(summary, { timedOut, deliveryId }) {
     };
   }
   if (timedOut || summary.status === 'empty') {
-    return {
-      action: 'await',
-      detail:
-        'Empty/timeout window — NORMAL for 15–60 min tasks. Re-call orca{action:"await",runId,waitMs:45000} ' +
-        '(no ack unless you have a prior deliveryId to acknowledge). Not a failure; do not restart the worker.',
-      deliveryId: null,
-      note: 'next.action is a hint; prefer summary.status if they disagree.',
-    };
+    if (livenessInfo && livenessInfo.liveness) {
+      return nextStepForLiveness({
+        liveness: livenessInfo.liveness,
+        emptyWindowsConsecutive: livenessInfo.emptyWindowsConsecutive,
+        msSinceActivity: livenessInfo.msSinceActivity,
+        deliveryId: null,
+      });
+    }
+    return nextStepForLiveness({ liveness: 'unknown', emptyWindowsConsecutive: 0, deliveryId: null });
   }
   return {
     action: 'process_messages',
@@ -615,6 +658,7 @@ function nextStepForAwait(summary, { timedOut, deliveryId }) {
     note: 'next.action is a hint; prefer summary.status if they disagree.',
   };
 }
+
 
 
 /**
@@ -956,6 +1000,12 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent }) {
  *   → orchestration dispatch --inject → liveness probe → terminal send recovery if idle
  */
 async function dispatchWorker(args = {}) {
+
+  try {
+    await ensureRuntimeReady();
+  } catch (e) {
+    return runtimeGuardRejection(e);
+  }
   const rawSpec = String(args.spec || '').trim();
   if (!rawSpec) throw new Error('spec is required (worker brief)');
   // Bridge enforces worker_done contract so system prompts need not repeat it.
@@ -1237,8 +1287,12 @@ async function dispatchWorker(args = {}) {
       agent,
       worktree: worktreePath || null,
       name: name || null,
+      dispatchedAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      emptyWindowsConsecutive: 0,
     });
   }
+
 
   return {
     ok: true,
@@ -1271,6 +1325,11 @@ async function dispatchWorker(args = {}) {
 }
 
 async function awaitDispatch(args = {}) {
+  try {
+    await ensureRuntimeReady();
+  } catch (e) {
+    return runtimeGuardRejection(e);
+  }
   const runId = String(args.run_id || '').trim();
   if (!runId) throw new Error('run_id is required');
   const waitMs = Math.min(Math.max(args.wait_ms ?? CHECK_WAIT_DEFAULT_MS, 0), CHECK_WAIT_MAX_MS);
@@ -1406,7 +1465,61 @@ async function awaitDispatch(args = {}) {
   }
   const empty = summary.status === 'empty' || summary.status === 'foreign_only';
   const effectiveTimedOut = res.timedOut === true || (empty && !deliveryId && !filtered);
-  let next = nextStepForAwait(summary, { timedOut: effectiveTimedOut, deliveryId });
+
+  // --- NAS-240: liveness from dispatch registry + optional terminal activity ---
+  const ck = currentClientKey();
+  const ownedEntries = dispatchRegistry
+    .list({ clientKey: ck })
+    .filter((d) => d.runId === runId || (d.dispatchId && owned.has(String(d.dispatchId))));
+  // Prefer entries still running / recently updated for this run.
+  let primaryEntry =
+    ownedEntries.find((d) => d.status === 'running') ||
+    ownedEntries.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0] ||
+    null;
+
+  let terminalLastOutputAt = null;
+  let terminalProbe = null;
+  if (empty && primaryEntry?.terminalHandle) {
+    try {
+      const snap = await terminalSnapshot(primaryEntry.terminalHandle);
+      terminalProbe = {
+        ok: snap.ok === true,
+        turns: snap.turns,
+        toolCalls: snap.toolCalls,
+        busyHint: snap.busyHint === true,
+        connected: snap.connected === true,
+        lastOutputAt: snap.lastOutputAt || null,
+      };
+      terminalLastOutputAt = snap.lastOutputAt || null;
+      // Treat busy / turns growth as activity even without lastOutputAt.
+      if (looksWorking(snap) && !terminalLastOutputAt) {
+        terminalLastOutputAt = new Date().toISOString();
+      }
+    } catch {
+      terminalProbe = { ok: false };
+    }
+  }
+
+  const prevEmpty = primaryEntry?.emptyWindowsConsecutive || 0;
+  const emptyWindowsConsecutive = empty ? prevEmpty + 1 : 0;
+  const lastActivityAt = pickLastActivityAt({
+    registryUpdatedAt: primaryEntry?.lastActivityAt || primaryEntry?.updatedAt || null,
+    terminalLastOutputAt,
+    lastMessageAt: empty ? null : new Date().toISOString(),
+  });
+  const livenessInfo = computeLiveness({
+    now: Date.now(),
+    dispatchedAt: primaryEntry?.dispatchedAt || primaryEntry?.createdAt || null,
+    lastActivityAt,
+    emptyWindowsConsecutive,
+    hasDispatch: Boolean(primaryEntry) || owned.size > 0,
+  });
+
+  let next = nextStepForAwait(summary, {
+    timedOut: effectiveTimedOut,
+    deliveryId,
+    livenessInfo: empty ? livenessInfo : null,
+  });
   if (summary.status === 'foreign_only' || (filtered && summary.status === 'empty')) {
     next = {
       action: 'await',
@@ -1415,6 +1528,7 @@ async function awaitDispatch(args = {}) {
         'Prefer summary.status; foreign_messages is informational.',
       deliveryId: deliveryId || null,
       note: 'Foreign worker_done never yields next.action=release.',
+      liveness: livenessInfo.liveness,
     };
   }
   if (next.action === 'release' && next.dispatchId && owned.size > 0 && !owned.has(String(next.dispatchId))) {
@@ -1428,7 +1542,6 @@ async function awaitDispatch(args = {}) {
   }
 
   // Surface dispatch status + redacted transcript snippets via resources.
-  const ck = currentClientKey();
   for (const m of messages) {
     const did =
       pick(m, 'dispatchId', 'dispatch_id') ||
@@ -1443,6 +1556,8 @@ async function awaitDispatch(args = {}) {
       clientKey: ck,
       lastDeliveryId: deliveryId || null,
       lastMessageType: t || null,
+      lastActivityAt: new Date().toISOString(),
+      emptyWindowsConsecutive: 0,
     });
     let body = '';
     try {
@@ -1464,6 +1579,17 @@ async function awaitDispatch(args = {}) {
       clientKey: ck,
       outcome: summary.worker_done.outcome || null,
       taskId: summary.worker_done.taskId || null,
+      lastActivityAt: new Date().toISOString(),
+      emptyWindowsConsecutive: 0,
+    });
+  } else if (primaryEntry?.dispatchId && empty) {
+    // Advance empty-window counter + activity on the tracked worker.
+    dispatchRegistry.upsert(primaryEntry.dispatchId, {
+      emptyWindowsConsecutive,
+      lastActivityAt: lastActivityAt || primaryEntry.lastActivityAt || null,
+      liveness: livenessInfo.liveness,
+      clientKey: ck,
+      runId,
     });
   }
 
@@ -1476,6 +1602,13 @@ async function awaitDispatch(args = {}) {
     count: typeof res.count === 'number' ? res.count : messages.length,
     summary,
     next,
+    // NAS-240 liveness signal (always present so clients need not special-case).
+    liveness: livenessInfo.liveness,
+    msSinceDispatch: livenessInfo.msSinceDispatch,
+    msSinceActivity: livenessInfo.msSinceActivity,
+    emptyWindowsConsecutive: livenessInfo.emptyWindowsConsecutive,
+    livenessReason: livenessInfo.reason,
+    terminalProbe: terminalProbe || undefined,
     messages,
     foreign_messages: foreignMessages.length ? foreignMessages : undefined,
     foreign_filtered: filtered || undefined,
@@ -1486,10 +1619,17 @@ async function awaitDispatch(args = {}) {
   };
 }
 
+
 async function releaseWorker(args = {}) {
+  try {
+    await ensureRuntimeReady();
+  } catch (e) {
+    return runtimeGuardRejection(e);
+  }
   const dispatchId = String(args.dispatch_id || '').trim();
   const handleHint = String(args.terminal_handle || args.handle || '').trim();
   if (!dispatchId && !handleHint) throw new Error('dispatch_id (or terminal handle) is required');
+
 
   // Inject-path (bridge default): after worker_done the Dispatch is already completed
   // and worker-release often returns dispatch_not_found. That is expected — cleanup is
@@ -1693,9 +1833,16 @@ const TOOLS = [
         types: { type: 'string', description: `Message types; default ${DEFAULT_WAIT_TYPES}` },
         peek: { type: 'boolean', description: 'Peek without consuming' },
         all: { type: 'boolean', description: 'For check: all messages' },
+        verbose: {
+          type: 'boolean',
+          description:
+            'For health: when true, return full statusProbe/actionAnnotations/coordinator dump. ' +
+            'Default false = compact (ok, bridge.version, versionOk, statusProbe.ok, sender, toolsets, next).',
+        },
       },
       required: [],
     },
+
   },
 ];
 
@@ -1727,8 +1874,11 @@ function pickArgs(args = {}) {
   return a;
 }
 
-async function healthPayload() {
-  const probe = await runOrca(['status', '--json'], { timeoutMs: 15_000 });
+async function healthPayload({ verbose = false } = {}) {
+  const probeRun = await runOrca(['status', '--json'], { timeoutMs: 15_000 });
+  const probe = describeRun(probeRun, true);
+  // Keep lazy gate warm so the next dispatch/await skips a probe within TTL.
+  runtimeProbeCache.set(probe);
   const versionOk = versionGte(VERSION, MIN_BRIDGE_VERSION);
   let sender = null;
   try {
@@ -1736,7 +1886,7 @@ async function healthPayload() {
   } catch (e) {
     sender = { ok: false, error: String(e?.message || e) };
   }
-  return {
+  const full = {
     bridge: {
       version: VERSION,
       minVersion: MIN_BRIDGE_VERSION,
@@ -1782,17 +1932,21 @@ async function healthPayload() {
       'orca-bridge://dispatches/{id}',
       'orca-bridge://transcripts/{id}',
     ],
-    statusProbe: describeRun(probe, true),
+    statusProbe: probe,
     coordinator: {
       stop_if_version_below: MIN_BRIDGE_VERSION,
       versionOk,
-      flow: 'dispatch → await(≤45s)×N → worker_done → release(+terminalHandle) → read-only',
+      flow: 'dispatch → await(≤45s)×N [honor liveness] → worker_done → release(+terminalHandle) → read-only',
       on_question:
         'orca{action:"cli",args:["orchestration","reply","--id","<id>","--body","<answer>","--json"]} then await+ack',
       prefer_status_over_next: true,
-      guide: 'orca{action:"guide"} for waves / brief / devices',
+      liveness_on_empty: true,
+      guide: 'orca{action:"guide"} for waves / brief / devices / stop-conditions',
       handoff_blocked: true,
       worker_contract_auto_appended: true,
+      health_optional:
+        'health is diagnostics (compact default; verbose:true for full dump). ' +
+        'dispatch/await/release self-check runtime/version — no pre-wave health ritual.',
       sender_auto_injected:
         'Headless orchestration gets --from / check --terminal from bridge (0.2.10+). ' +
         '0.2.11+: per-OAuth-client sender. 0.2.12+: pin-by-handle (shell rewrites titles; no mid-wave recreate). ' +
@@ -1803,7 +1957,8 @@ async function healthPayload() {
         ? {
             action: 'dispatch_or_guide',
             detail:
-              'Bridge ready. Start workers with action=dispatch. Call action=guide once if you need waves/brief/devices discipline.',
+              'Bridge ready. Start workers with action=dispatch. Call action=guide once if you need waves/brief/devices discipline. ' +
+              'health is optional diagnostics — not required before each wave.',
           }
         : {
             action: 'fix_sender',
@@ -1818,7 +1973,13 @@ async function healthPayload() {
             'Do NOT fall back to worktree create --agent --prompt.',
         },
   };
+
+  if (verbose) {
+    return { ...full, verbose: true, ok: versionOk && full.statusProbe?.ok !== false };
+  }
+  return compactHealthPayload(full);
 }
+
 
 async function callTool(name, args = {}) {
   const a = pickArgs(args);
@@ -1863,7 +2024,8 @@ async function callTool(name, args = {}) {
 }
 
 async function callToolUnlocked(op, a) {
-  if (op === 'health') return healthPayload();
+  if (op === 'health') return healthPayload({ verbose: a.verbose === true });
+
 
   if (op === 'guide') return coordinatorGuide();
 
@@ -2004,10 +2166,11 @@ async function handleRpc(msg, { sessionId } = {}) {
           serverInfo: { name: 'orca-bridge', version: VERSION },
           instructions:
             'orca-bridge v' + VERSION + ' (min ' + MIN_BRIDGE_VERSION + '). Single tool `orca` + action. ' +
-            'Session start: action=health (require versionOk + statusProbe.ok). ' +
             'Workers: dispatch → await(waitMs:45000)×N → worker_done → release(dispatchId,terminalHandle). ' +
-            'Empty await = re-call. question → cli orchestration reply then await+ack. ' +
-            'Prefer summary.status over next.action. guide = waves/brief/devices. ' +
+            'Runtime/version self-checked lazily on dispatch/await/release (errors include code+recovery). ' +
+            'Empty await carries liveness active|idle|stalled|unknown — re-call while active/idle; stalled → diagnose (peek/ping/release+report). ' +
+            'question → cli orchestration reply then await+ack. Prefer summary.status over next.action; honor liveness on empty. ' +
+            'health = optional compact diagnostics (verbose:true for full dump). guide = waves/brief/devices/stop-conditions. ' +
             'worker_done contract auto-appended on dispatch. ' +
             'Per-OAuth-client sender pin-by-handle (0.2.12+) — no mid-wave recreate; multi-coord safe. ' +
             'worktree create --agent --prompt rejected on cli.',
@@ -2015,6 +2178,7 @@ async function handleRpc(msg, { sessionId } = {}) {
         sessionId: sid,
         isInitialize: true,
       };
+
     }
     if (method === 'notifications/initialized' || method?.startsWith('notifications/')) {
       return { response: null, sessionId };
