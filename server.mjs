@@ -104,7 +104,7 @@ const MAX_TIMEOUT_MS = 570_000;       // under typical tunnel/platform minute ca
 const WORKER_START_TIMEOUT_MS = 180_000; // agent TUI ready + inject
 const SESSION_TTL_MS = 24 * 60 * 60_000;
 const SSE_KEEPALIVE_MS = 15_000;
-// Default repo for Hyperagent dispatches (optional). Example: path:/Users/me/repo
+// Default repo for Hyperagent dispatches (optional). Example: path:/home/USER/repo
 const DEFAULT_REPO = (process.env.ORCA_BRIDGE_DEFAULT_REPO || '').trim();
 const DEFAULT_AGENT = (process.env.ORCA_BRIDGE_DEFAULT_AGENT || 'omp').trim() || 'omp';
 // ORCA_BRIDGE_DEBUG=0 mutes the verbose access log (on by default).

@@ -8,9 +8,11 @@ StartLimitBurst=5
 [Service]
 Type=simple
 # Edit User/Group/paths for your host.
+# User/Group `orca` is the recommended dedicated service account for this unit.
 User=orca
 Group=orca
 WorkingDirectory=/opt/orca-mcp
+# HOME/PATH must match the service account home on your host (replace USER).
 Environment=HOME=/home/USER
 Environment=PATH=/home/USER/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Plain KEY=VALUE env file (mode 600). Token/origin stay on the host, not in git.

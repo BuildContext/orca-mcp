@@ -1,7 +1,6 @@
 {
   "name": "orca-mcp",
   "version": "0.2.13",
-  "private": true,
   "description": "External MCP server for controlling Orca (worktrees, sessions, orchestration)",
   "type": "module",
   "mcpName": "io.github.buildcontext/orca-mcp",
