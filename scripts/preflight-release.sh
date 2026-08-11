@@ -151,14 +151,30 @@ else
 fi
 
 # ── optional docker ───────────────────────────────────────────────────────
-if docker info >/dev/null 2>&1; then
-  if docker build -t "orca-mcp-preflight:${VERSION}" . >/tmp/orca-preflight-docker.log 2>&1; then
+# Prefer direct docker; fall back to `sg docker` when the process lacks the
+# group (common after usermod until re-login). Durable membership: usermod -aG docker.
+_docker() {
+  if docker info >/dev/null 2>&1; then
+    docker "$@"
+  elif command -v sg >/dev/null 2>&1 && sg docker -c 'docker info' >/dev/null 2>&1; then
+    # Quote args for the nested shell.
+    local q=() a
+    for a in "$@"; do q+=("$(printf '%q' "$a")"); done
+    sg docker -c "docker ${q[*]}"
+  else
+    return 127
+  fi
+}
+
+if _docker info >/dev/null 2>&1; then
+  if _docker build -t "orca-mcp-preflight:${VERSION}" . >/tmp/orca-preflight-docker.log 2>&1; then
     pass "docker build ok (local tag orca-mcp-preflight:${VERSION})"
   else
     fail "docker build failed — see /tmp/orca-preflight-docker.log"
   fi
 else
   warn "docker unavailable or no permission (sock) — skip image build; GHCR job will build in Actions"
+  note "  fix: sudo usermod -aG docker \"\$USER\" && newgrp docker   # or: sg docker -c 'docker …'"
 fi
 
 printf '\n'
