@@ -102,7 +102,7 @@ MCP clients cannot natively control Orca. Shelling out to the CLI works only whe
 - **Zero npm dependencies** — `node server.mjs` and done
 - **Mac LaunchAgent** + **Linux systemd** deploy helpers under `deploy/`
 
-Current bridge version: **0.2.13** (see `VERSION` in `server.mjs`).
+Current bridge version: **0.3.0** (from `package.json`).
 
 ---
 
@@ -112,7 +112,7 @@ Current bridge version: **0.2.13** (see `VERSION` in `server.mjs`).
 
 Desktop MCP hosts (Claude Desktop, Cursor, VS Code, Windsurf, Claude Code) launch the bridge as a **subprocess** and speak **newline-delimited JSON-RPC** on stdin/stdout. No browser OAuth — secrets come from the environment (MCP guidance for stdio servers).
 
-**Install today from git / a local checkout** (the npm package is not published yet — `npx orca-mcp` will 404 until the first release). Prefer the [container image](#container-ghcr) for long-lived or privileged hosts once GHCR tags exist; until then build the `Dockerfile` locally.
+**Published package:** pin the version with `npx -y orca-mcp@0.3.0`. Prefer the [container image](#container-ghcr) for long-lived or privileged hosts.
 
 ### Standard config (local checkout)
 
@@ -147,7 +147,7 @@ After the first npm publish, the same host configs can switch to the registry pa
   "mcpServers": {
     "orca": {
       "command": "npx",
-      "args": ["-y", "orca-mcp@0.2.13", "--stdio"],
+      "args": ["-y", "orca-mcp@0.3.0", "--stdio"],
       "env": {
         "ORCA_BRIDGE_TOKEN": "<openssl rand -hex 32>",
         "ORCA_CLI_COMMAND": "orca"
@@ -179,7 +179,7 @@ Use the **Standard config (local checkout)** JSON above (`mcpServers.orca`).
 claude mcp add orca --env ORCA_BRIDGE_TOKEN=… -- node /absolute/path/to/orca-mcp/server.mjs --stdio
 
 # After npm publish (pin the version):
-claude mcp add orca --env ORCA_BRIDGE_TOKEN=… -- npx -y orca-mcp@0.2.13 --stdio
+claude mcp add orca --env ORCA_BRIDGE_TOKEN=… -- npx -y orca-mcp@0.3.0 --stdio
 ```
 
 </details>
@@ -193,7 +193,7 @@ claude mcp add orca --env ORCA_BRIDGE_TOKEN=… -- npx -y orca-mcp@0.2.13 --stdi
 - Args: `/absolute/path/to/orca-mcp/server.mjs --stdio`
 - Env: `ORCA_BRIDGE_TOKEN`, optional `ORCA_CLI_COMMAND`
 
-Or merge the **Standard config (local checkout)** into Cursor’s MCP JSON. After npm publish you can switch to `npx` + `orca-mcp@0.2.13` as in the “Soon: npm package” example.
+Or merge the **Standard config (local checkout)** into Cursor’s MCP JSON. After npm publish you can switch to `npx` + `orca-mcp@0.3.0` as in the “Soon: npm package” example.
 
 </details>
 
@@ -205,7 +205,7 @@ Or merge the **Standard config (local checkout)** into Cursor’s MCP JSON. Afte
 code --add-mcp '{"name":"orca","command":"node","args":["/absolute/path/to/orca-mcp/server.mjs","--stdio"],"env":{"ORCA_BRIDGE_TOKEN":"<token>"}}'
 
 # After npm publish:
-# code --add-mcp '{"name":"orca","command":"npx","args":["-y","orca-mcp@0.2.13","--stdio"],"env":{"ORCA_BRIDGE_TOKEN":"<token>"}}'
+# code --add-mcp '{"name":"orca","command":"npx","args":["-y","orca-mcp@0.3.0","--stdio"],"env":{"ORCA_BRIDGE_TOKEN":"<token>"}}'
 ```
 
 Or add the same object under `"mcp": { "servers": { … } }` in `.vscode/mcp.json` / user `settings.json` (see current VS Code MCP docs for the exact key — it has moved between preview builds).
@@ -245,7 +245,7 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   | node /absolute/path/to/orca-mcp/server.mjs --stdio
 # Expect two JSON-RPC response lines on stdout (initialize + tools/list); banners on stderr only.
-# After npm publish you can substitute: npx -y orca-mcp@0.2.13 --stdio
+# After npm publish you can substitute: npx -y orca-mcp@0.3.0 --stdio
 ```
 
 ---
@@ -256,20 +256,20 @@ Docker's guidance for privileged MCP servers is **container over bare registry i
 
 ```bash
 # pin by semver
-docker pull ghcr.io/buildcontext/orca-mcp:0.2.13
+docker pull ghcr.io/buildcontext/orca-mcp:0.3.0
 
 # stdio (local MCP host launches the container)
 docker run --rm -i \
   -e ORCA_BRIDGE_TOKEN \
   -e ORCA_CLI_COMMAND=orca \
-  ghcr.io/buildcontext/orca-mcp:0.2.13 --stdio
+  ghcr.io/buildcontext/orca-mcp:0.3.0 --stdio
 
 # HTTP on loopback (publish via Funnel / reverse proxy yourself)
 docker run --rm \
   -e ORCA_BRIDGE_TOKEN \
   -e ORCA_BRIDGE_PUBLIC_ORIGIN=https://your-host.example.ts.net \
   -p 127.0.0.1:8787:8787 \
-  ghcr.io/buildcontext/orca-mcp:0.2.13
+  ghcr.io/buildcontext/orca-mcp:0.3.0
 ```
 
 After each release the image is also digest-pinned in the GitHub Release notes. Prefer the digest in production:
@@ -302,7 +302,7 @@ export ORCA_BRIDGE_PUBLIC_ORIGIN="https://your-host.example.ts.net"   # optional
 node server.mjs --port 8787
 
 # After npm publish (HTTP mode):
-# npx -y orca-mcp@0.2.13 --port 8787
+# npx -y orca-mcp@0.3.0 --port 8787
 ```
 
 The server binds **127.0.0.1 only**. Publish it yourself:
