@@ -1,0 +1,3 @@
+# package.json "files" already lists only runtime modules; keep this so a
+# future "lib/" allowlist does not accidentally ship tests.
+*.test.mjs

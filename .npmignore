@@ -1,0 +1,35 @@
+# Keep the published tarball aligned with runtime needs.
+# package.json "files" is the allowlist; this denylist strips test noise
+# that would otherwise ride along under lib/.
+
+# Tests
+**/*.test.mjs
+*.test.mjs
+coverage
+.nyc_output
+
+# Local / secrets / tooling (belt-and-suspenders vs files allowlist)
+.env
+.env.*
+**/.orca-bridge/
+**/.orca-bridge*
+*.pem
+*.key
+*.local
+*.tgz
+*.log
+npm-debug.log*
+node_modules/
+
+# VCS / IDE / OS
+.git
+.github
+.idea
+.vscode
+.DS_Store
+*.swp
+*~
+
+# Private scrub overrides (never ship)
+scripts/scrub-denylist.local
+scrub-denylist.local

@@ -218,11 +218,23 @@ else
 fi
 
 # ── GitHub secrets + repo visibility ──────────────────────────────────────
+# NPM_TOKEN is a CI publish secret. Developers must not need it locally.
+# Outside CI: skip with a clear message. Inside CI/Actions: require the
+# repo secret so release.yml can authenticate to npm.
+IN_CI=0
+if [[ "${CI:-}" == "true" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  IN_CI=1
+fi
+
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  if gh secret list -R BuildContext/orca-mcp 2>/dev/null | grep -q '^NPM_TOKEN'; then
-    pass "GitHub secret NPM_TOKEN is set on BuildContext/orca-mcp"
+  if [[ "$IN_CI" -eq 1 ]]; then
+    if gh secret list -R BuildContext/orca-mcp 2>/dev/null | grep -q '^NPM_TOKEN'; then
+      pass "GitHub secret NPM_TOKEN is set on BuildContext/orca-mcp"
+    else
+      fail "GitHub secret NPM_TOKEN missing on BuildContext/orca-mcp"
+    fi
   else
-    fail "GitHub secret NPM_TOKEN missing on BuildContext/orca-mcp"
+    warn "skip NPM_TOKEN check outside CI (CI/GITHUB_ACTIONS not set) — CI will enforce"
   fi
   VIS=$(gh api repos/BuildContext/orca-mcp --jq .visibility 2>/dev/null || echo unknown)
   if [[ "$VIS" == "public" ]]; then
@@ -236,7 +248,11 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     pass "GHCR package not yet created (first release.yml run will create it via GITHUB_TOKEN)"
   fi
 else
-  warn "gh not ready — skipped secret/visibility checks"
+  if [[ "$IN_CI" -eq 1 ]]; then
+    fail "gh not ready in CI — cannot verify NPM_TOKEN secret"
+  else
+    warn "gh not ready — skipped secret/visibility checks"
+  fi
 fi
 
 # ── optional docker ───────────────────────────────────────────────────────
