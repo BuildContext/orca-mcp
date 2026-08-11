@@ -355,12 +355,15 @@ Expect `statusProbe.ok: true` and a `bridge.version`.
 Raw `worktree create --agent --prompt` is **rejected** (`forbidden_handoff`). Use the action API:
 
 ```text
-health → dispatch → await(≤45s)×N → worker_done → release(dispatchId, terminalHandle) → read-only
+dispatch → await(≤45s)×N [honor liveness] → worker_done → release(dispatchId, terminalHandle) → read-only
 ```
+
+Runtime/version gates run **lazily** inside `dispatch` / `await` / `release` (self-diagnosing errors). `health` is optional compact diagnostics (`verbose:true` for the full dump).
 
 | `await` summary.status | Meaning |
 | --- | --- |
-| empty / timeout | Re-call `await` — normal |
+| empty / timeout (active\|idle) | Re-call `await` — normal early; watch `liveness` |
+| empty + liveness=stalled | Stop-condition: peek → ping → release + report |
 | question | Reply via `cli` → `orchestration reply`, then await + ack |
 | escalation | Read body; answer / re-task / fail; always ack |
 | worker_done | `release` with `dispatchId` + worker `terminalHandle` |
@@ -373,7 +376,7 @@ Example wave:
 // 1. start work
 { "action": "dispatch", "spec": "…", "repo": "path:/path/to/repo", "agent": "omp" }
 
-// 2. poll until worker_done (repeat)
+// 2. poll until worker_done (repeat; honor liveness on empty)
 { "action": "await", "runId": "<from dispatch>", "waitMs": 45000 }
 
 // 3. cleanup
