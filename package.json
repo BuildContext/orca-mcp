@@ -42,7 +42,12 @@
   },
   "files": [
     "server.mjs",
-    "lib/",
+    "lib/audit.mjs",
+    "lib/cli-policy.mjs",
+    "lib/coordinator-doctrine.mjs",
+    "lib/orch-isolation.mjs",
+    "lib/security-core.mjs",
+    "lib/toolsets.mjs",
     "scripts/",
     "docs/",
     "COORDINATOR.md",
