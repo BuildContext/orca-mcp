@@ -37,7 +37,7 @@ import os from 'node:os';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes } from 'node:crypto';
-import { URL } from 'node:url';
+import { URL, fileURLToPath } from 'node:url';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createInterface } from 'node:readline';
 import {
@@ -87,7 +87,10 @@ import {
 
 const execFile = promisify(execFileCb);
 
-const VERSION = '0.2.13';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const VERSION = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'),
+).version;
 /** `--stdio` → NDJSON on stdin/stdout; default remains Streamable HTTP. */
 const STDIO_MODE = process.argv.includes('--stdio');
 
@@ -301,6 +304,12 @@ function versionGte(a, b) {
 /** Long discipline docs for coordinators (also generated into COORDINATOR.md). */
 function coordinatorGuide() {
   return buildCoordinatorGuide({ version: VERSION, minVersion: MIN_BRIDGE_VERSION });
+}
+
+// Allow `orca-mcp --version` / `-V` without requiring auth (install smoke checks).
+if (process.argv.includes('--version') || process.argv.includes('-V')) {
+  process.stdout.write(`${VERSION}\n`);
+  process.exit(0);
 }
 
 const TOKEN = process.env.ORCA_BRIDGE_TOKEN || '';

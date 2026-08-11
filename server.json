@@ -7,14 +7,14 @@
     "url": "https://github.com/BuildContext/orca-mcp",
     "source": "github"
   },
-  "version": "0.2.13",
+  "version": "0.3.0",
   "websiteUrl": "https://github.com/BuildContext/orca-mcp",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "orca-mcp",
-      "version": "0.2.13",
+      "version": "0.3.0",
       "transport": {
         "type": "stdio"
       },
@@ -27,7 +27,7 @@
       "environmentVariables": [
         {
           "name": "ORCA_BRIDGE_TOKEN",
-          "description": "Master bridge token (\u226516 chars). Required. Auth for stdio hosts and HTTP path-token/OAuth password.",
+          "description": "Master bridge token (≥16 chars). Required. Auth for stdio hosts and HTTP path-token/OAuth password.",
           "isRequired": true,
           "isSecret": true
         },
@@ -38,7 +38,7 @@
         },
         {
           "name": "ORCA_BRIDGE_DEFAULT_REPO",
-          "description": "Default --repo for dispatch (path:/\u2026 or name:\u2026).",
+          "description": "Default --repo for dispatch (path:/… or name:…).",
           "isRequired": false
         },
         {
@@ -55,7 +55,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/buildcontext/orca-mcp:0.2.13",
+      "identifier": "ghcr.io/buildcontext/orca-mcp:0.3.0",
       "transport": {
         "type": "stdio"
       },
@@ -80,7 +80,7 @@
       "environmentVariables": [
         {
           "name": "ORCA_BRIDGE_TOKEN",
-          "description": "Master bridge token (\u226516 chars). Required.",
+          "description": "Master bridge token (≥16 chars). Required.",
           "isRequired": true,
           "isSecret": true
         },

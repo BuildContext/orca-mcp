@@ -1,6 +1,6 @@
 # Threat model
 
-Honest scope for **orca-mcp** (bridge version documented against `main` / 0.2.13-era code). This is not a compliance artifact and not a promise of safety. It states what the process can do, who we trust, what we mitigate today, and what we deliberately do **not**.
+Honest scope for **orca-mcp** (bridge version documented against `main` / 0.3.0-era code). This is not a compliance artifact and not a promise of safety. It states what the process can do, who we trust, what we mitigate today, and what we deliberately do **not**.
 
 Companion docs: [SECURITY.md](../SECURITY.md) (reporting), [README security warning](../README.md#security-warning), [design rationale](./design.md).
 

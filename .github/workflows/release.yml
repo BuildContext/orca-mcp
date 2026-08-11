@@ -1,7 +1,7 @@
 # Publish orca-mcp to npm (with provenance) and GHCR on version tags.
 #
 # Trigger:
-#   git tag v0.2.13 && git push origin v0.2.13
+#   git tag v0.3.0 && git push origin v0.3.0
 #   — or workflow_dispatch with the same tag name.
 #
 # Required repo secrets:
@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag already on the default branch tip (e.g. v0.2.13). Leave empty when triggered by push.'
+        description: 'Tag already on the default branch tip (e.g. v0.3.0). Leave empty when triggered by push.'
         required: false
         type: string
 

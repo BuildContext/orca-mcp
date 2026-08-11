@@ -34,7 +34,7 @@ EXPOSE 8787
 
 # ENTRYPOINT is the bridge; CMD is the default HTTP listen args.
 # Examples:
-#   docker run --rm -e ORCA_BRIDGE_TOKEN=… -p 8787:8787 ghcr.io/buildcontext/orca-mcp:0.2.13
-#   docker run --rm -i -e ORCA_BRIDGE_TOKEN=… ghcr.io/buildcontext/orca-mcp:0.2.13 --stdio
+#   docker run --rm -e ORCA_BRIDGE_TOKEN=… -p 8787:8787 ghcr.io/buildcontext/orca-mcp:0.3.0
+#   docker run --rm -i -e ORCA_BRIDGE_TOKEN=… ghcr.io/buildcontext/orca-mcp:0.3.0 --stdio
 ENTRYPOINT ["node", "server.mjs"]
 CMD ["--port", "8787"]
