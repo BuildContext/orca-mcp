@@ -59,6 +59,12 @@ import {
   tokenMatches as tokenMatchesCore,
   extractBearer,
   injectSenderArgv,
+  parseOrchestrationReplyArgv,
+  resolveWorkerDispatchId,
+  buildEscalationReplyFollowupSendArgv,
+  replyEnvelopeIsQuestionAnswer,
+  isStaleDeliveryError,
+  explainStaleDeliveryError,
 } from './lib/security-core.mjs';
 import {
   createCliPolicy,
@@ -282,7 +288,9 @@ const WORKER_CONTRACT_MARKER = '<!-- orca-bridge-worker-contract -->';
 const WORKER_CONTRACT_BLOCK =
   `${WORKER_CONTRACT_MARKER}\n` +
   'On completion: emit exactly one worker_done with --outcome succeeded|failed and a concise 3-sentence body. ' +
-  'Do not close the terminal yourself — the coordinator releases it.\n';
+  'Do not close the terminal yourself — the coordinator releases it.\n' +
+  'For a blocking coordinator answer use orchestration ask (not send --type escalation + check). ' +
+  'Escalation notifies the coordinator; a bridge dual-routes reply onto dispatch:<id> so worker check can see it.\n';
 
 /**
  * Append the supervised completion contract unless already present.
@@ -631,12 +639,18 @@ function nextStepForAwait(summary, { timedOut, deliveryId, livenessInfo = null }
     };
   }
   if (summary.status === 'escalation') {
+    const eid = summary.escalation?.id || '<escalation.id>';
     return {
-      action: 'handle_escalation',
+      action: 'reply_then_ack',
       detail:
-        'summary.status=escalation. Read body; decide (cli terminal send / new dispatch / fail). ' +
-        'Always ack deliveryId on next await. Do not stay silent.',
+        'summary.status=escalation. Reply: orca{action:"cli",args:["orchestration","reply","--id","' +
+        eid +
+        '","--body","<answer>","--json"]} ' +
+        '(bridge dual-routes non-question replies onto dispatch:<id> so the waiting worker unblocks). ' +
+        'Then await with ack=deliveryId. Prefer ask for true back-and-forth.',
       deliveryId: deliveryId || null,
+      escalationId: summary.escalation?.id || null,
+      reply_argv: ['orchestration', 'reply', '--id', String(eid), '--body', '<answer>', '--json'],
       note: 'next.action is a hint; prefer summary.status if they disagree.',
     };
   }
@@ -657,6 +671,127 @@ function nextStepForAwait(summary, { timedOut, deliveryId, livenessInfo = null }
     deliveryId: deliveryId || null,
     note: 'next.action is a hint; prefer summary.status if they disagree.',
   };
+}
+
+/**
+ * NAS-239: after a successful non-question orchestration reply, dual-route the
+ * body onto dispatch:<id>. Orca's native reply targets the worker terminal
+ * handle with type=status; workers with an active Dispatch read dispatch:<id>.
+ * Question answers already land on dispatch via question_threads — skip those.
+ */
+async function dualRouteNonQuestionReply(argv, replyDescribed) {
+  const parsed = parseOrchestrationReplyArgv(argv);
+  if (!parsed || !parsed.ok) return null;
+  if (!replyDescribed || replyDescribed.ok === false) return null;
+  const env = replyDescribed.envelope || {};
+  if (env.ok === false) return null;
+  if (replyEnvelopeIsQuestionAnswer(env)) {
+    return { skipped: true, reason: 'question_answer_already_on_dispatch' };
+  }
+
+  const result = env.result && typeof env.result === 'object' ? env.result : env;
+  const replyMessage = result.message || result;
+
+  // Prefer payload/dispatch on the original escalation (inbox / worker-show).
+  let originalMessage = null;
+  try {
+    const inbox = await runJson(
+      ['orchestration', 'inbox', '--full', '--limit', '100', '--json'],
+      { timeoutMs: 20_000 },
+    );
+    const messages =
+      inbox.envelope?.result?.messages ||
+      inbox.envelope?.messages ||
+      inbox.envelope?.result ||
+      [];
+    if (Array.isArray(messages)) {
+      originalMessage =
+        messages.find((m) => pick(m, 'id', 'messageId', 'message_id') === parsed.id) || null;
+    }
+  } catch {
+    /* best-effort */
+  }
+
+  let workers = [];
+  try {
+    const listed = await runJson(['orchestration', 'worker-list', '--json'], { timeoutMs: 20_000 });
+    workers =
+      listed.envelope?.result?.workers ||
+      listed.envelope?.workers ||
+      [];
+    if (!Array.isArray(workers)) workers = [];
+  } catch {
+    workers = [];
+  }
+
+  const dispatchId = resolveWorkerDispatchId({
+    originalMessage,
+    replyMessage,
+    workers,
+  });
+  if (!dispatchId) {
+    return {
+      skipped: true,
+      reason: 'dispatch_id_unresolved',
+      reply_to: pick(replyMessage, 'to_handle', 'to') || null,
+      original_id: parsed.id,
+    };
+  }
+
+  // If native reply already targeted dispatch:<id>, do not double-send.
+  const nativeTo = String(pick(replyMessage, 'to_handle', 'to') || '');
+  if (nativeTo === `dispatch:${dispatchId}` || nativeTo === dispatchId) {
+    return { skipped: true, reason: 'native_reply_already_on_dispatch', dispatchId };
+  }
+
+  const subject =
+    pick(replyMessage, 'subject', 'title') ||
+    (originalMessage
+      ? `Re: ${pick(originalMessage, 'subject', 'title') || 'escalation'}`
+      : 'Re: escalation');
+  const threadId =
+    pick(replyMessage, 'thread_id', 'threadId') ||
+    pick(originalMessage || {}, 'thread_id', 'threadId', 'id') ||
+    parsed.id;
+  const body =
+    parsed.body != null
+      ? parsed.body
+      : pick(replyMessage, 'body', 'text', 'content') || '';
+  const runId =
+    parsed.run ||
+    pick(replyMessage, 'run_id', 'runId') ||
+    pick(originalMessage || {}, 'run_id', 'runId') ||
+    null;
+  const from =
+    parsed.from ||
+    pick(replyMessage, 'from_handle', 'from') ||
+    null;
+
+  const sendArgv = buildEscalationReplyFollowupSendArgv({
+    dispatchId,
+    body,
+    subject,
+    threadId,
+    runId,
+    from: from && String(from).startsWith('run:') ? null : from,
+  });
+  const sendDescribed = await runJson(sendArgv, { timeoutMs: 30_000 });
+  return {
+    dual_routed: sendDescribed.ok !== false && sendDescribed.envelope?.ok !== false,
+    dispatchId,
+    send: sendDescribed.envelope || sendDescribed,
+    reason: 'worker_dispatch_mailbox',
+  };
+}
+
+function staleFromDescribed(described, ackId) {
+  const env = described?.envelope || {};
+  const err = env.error || {};
+  return explainStaleDeliveryError({
+    ackId,
+    errorCode: err.code,
+    errorMessage: err.message || err.code,
+  });
 }
 
 
@@ -1393,6 +1528,7 @@ async function awaitDispatch(args = {}) {
     /consumer_fenced|not run_|fenced consumer|no longer bound/i.test(
       String(env.error?.message || env.error?.code || ''),
     );
+  let staleInfo = ack ? staleFromDescribed(described, ack) : null;
 
   // Stale in-memory bind (stolen by another client, or process disagreed with runtime):
   // rebind once; drop ack if any.
@@ -1413,14 +1549,39 @@ async function awaitDispatch(args = {}) {
       /consumer_fenced|not run_|fenced consumer|no longer bound/i.test(
         String(env.error?.message || env.error?.code || ''),
       );
+    staleInfo = null;
+  } else if (staleInfo && ack) {
+    // msg_… ack or foreign/expired deliveryId — drop and retry once without ack.
+    ackDropped = {
+      deliveryId: ack,
+      reason: staleInfo.hint || 'stale_delivery',
+      detail: staleInfo.message,
+    };
+    ack = null;
+    described = await runJson(buildCheckArgv(null), { timeoutMs: waitMs + 30_000 });
+    env = described.envelope || {};
+    fence =
+      env.error?.code === 'consumer_fenced' ||
+      /consumer_fenced|not run_|fenced consumer|no longer bound/i.test(
+        String(env.error?.message || env.error?.code || ''),
+      );
+    staleInfo = staleFromDescribed(described, ackDropped.deliveryId);
+    // If retry still stale with no ack, clear — shouldn't happen without ack.
+    if (!ack) staleInfo = null;
   }
 
-  if ((!described.envelope && described.ok === false) || fence) {
+  if ((!described.envelope && described.ok === false) || fence || (env.error && isStaleDeliveryError(env.error?.code, env.error?.message))) {
+    const stillStale = staleFromDescribed(described, ackDropped?.deliveryId || args.ack);
     return {
       ok: false,
       run_id: runId,
       window_ms: waitMs,
-      error: fence ? 'consumer_fenced' : 'check failed',
+      error: fence
+        ? 'consumer_fenced'
+        : stillStale
+          ? 'stale_delivery'
+          : 'check failed',
+      error_detail: stillStale || undefined,
       client_key: currentClientKey(),
       sender_handle: sender.handle,
       run_use: useRes?.envelope || useRes || null,
@@ -1428,12 +1589,13 @@ async function awaitDispatch(args = {}) {
       ack_dropped: ackDropped || undefined,
       raw: described,
       next: {
-        action: 'retry_await_without_ack_once',
-        detail:
-          'Mailbox check failed (consumer_fenced). Bridge skips run-use when already bound (0.2.13+). ' +
-          'If another session shares this OAuth token it can steal the bind — use a separate OAuth token. ' +
-          'Retry await without ack once (bridge already dropped invalid ack on rebind). ' +
-          'Or worker-show --dispatch for inject-path status.',
+        action: stillStale ? 'retry_await_without_ack_once' : 'retry_await_without_ack_once',
+        detail: stillStale
+          ? stillStale.message
+          : 'Mailbox check failed (consumer_fenced). Bridge skips run-use when already bound (0.2.13+). ' +
+            'If another session shares this OAuth token it can steal the bind — use a separate OAuth token. ' +
+            'Retry await without ack once (bridge already dropped invalid ack on rebind). ' +
+            'Or worker-show --dispatch for inject-path status.',
       },
     };
   }
@@ -2064,9 +2226,11 @@ async function callToolUnlocked(op, a) {
   if (op === 'check') {
     const waitMs = Math.min(Math.max(a.waitMs ?? CHECK_WAIT_DEFAULT_MS, 0), CHECK_WAIT_MAX_MS);
     const types = a.types != null ? String(a.types) : DEFAULT_WAIT_TYPES;
+    let ack = a.ack != null && String(a.ack).trim() !== '' ? String(a.ack).trim() : null;
+    let ackDropped = null;
     let argv = ['orchestration', 'check'];
     if (a.runId) argv.push('--run', String(a.runId));
-    if (a.ack) argv.push('--ack', String(a.ack));
+    if (ack) argv.push('--ack', ack);
     if (a.peek) argv.push('--peek');
     if (a.all) argv.push('--all');
     if (types) argv.push('--types', types);
@@ -2099,8 +2263,40 @@ async function callToolUnlocked(op, a) {
         },
       };
     }
-    const run = await runOrca(argv, { timeoutMs: waitMs + 30_000 });
-    return { window_ms: waitMs, client_key: currentClientKey(), ...describeRun(run, true) };
+    let run = await runOrca(argv, { timeoutMs: waitMs + 30_000 });
+    let described = describeRun(run, true);
+    let staleInfo = ack ? staleFromDescribed(described, ack) : null;
+    if (staleInfo && ack) {
+      // Drop bad ack (often messages[].id) and retry once without it.
+      ackDropped = {
+        deliveryId: ack,
+        reason: staleInfo.hint || 'stale_delivery',
+        detail: staleInfo.message,
+      };
+      const retryArgv = argv.filter((t, i, arr) => {
+        if (t === '--ack') return false;
+        if (i > 0 && arr[i - 1] === '--ack') return false;
+        return true;
+      });
+      run = await runOrca(retryArgv, { timeoutMs: waitMs + 30_000 });
+      described = describeRun(run, true);
+      staleInfo = staleFromDescribed(described, ackDropped.deliveryId);
+      // Successful retry clears stale; if still stale without ack, keep envelope.
+      if (described.ok !== false && !described.envelope?.error) staleInfo = null;
+    }
+    return {
+      window_ms: waitMs,
+      client_key: currentClientKey(),
+      ...described,
+      ack_dropped: ackDropped || undefined,
+      error_detail: staleInfo || undefined,
+      next: staleInfo
+        ? {
+            action: 'retry_check_without_ack',
+            detail: staleInfo.message,
+          }
+        : undefined,
+    };
   }
 
   if (op === 'cli') {
@@ -2126,7 +2322,24 @@ async function callToolUnlocked(op, a) {
       }
     }
     const run = await runOrca(argv, { timeoutMs: a.timeoutMs, cwd: a.cwd });
-    return describeRun(run, a.args.includes('--json'));
+    const described = describeRun(run, a.args.includes('--json'));
+    // NAS-239 dual-route: non-question reply → also send to dispatch:<id>.
+    if (
+      a.args[0] === 'orchestration' &&
+      String(a.args[1] || '').toLowerCase() === 'reply' &&
+      described.ok !== false
+    ) {
+      try {
+        const dual = await dualRouteNonQuestionReply(a.args, described);
+        if (dual) described.escalation_reply_route = dual;
+      } catch (e) {
+        described.escalation_reply_route = {
+          dual_routed: false,
+          error: String(e?.message || e),
+        };
+      }
+    }
+    return described;
   }
 
   throw new Error(`unknown tool: ${op}`);
