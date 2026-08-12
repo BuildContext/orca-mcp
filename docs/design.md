@@ -243,6 +243,50 @@ documented in the README (capability toolsets / CLI allowlist).
 
 ---
 
+## State file ownership
+
+The bridge persists three things, all under the `HOME` of the account it runs as:
+`~/.orca-bridge-tokens.json` (issued OAuth access tokens),
+`~/.orca-bridge-sender-pins.json` (per-client sender pins) and `~/.orca-bridge/`
+(audit log). There is no server-side database; this *is* the durable state.
+
+### The failure mode (NAS-241)
+
+A cutover script ran a token-store migration **as root**. It wrote correctly —
+`mkstemp` + `chmod 0600` + `os.replace()` — but an atomic replace installs a *new
+inode*, and the new inode is owned by whoever performed the write. The store became
+`root:root 0600` while the unit runs as `orca`.
+
+What makes this expensive is how quiet it is:
+
+- The bridge starts fine. `readFileSync` throws, the catch swallows it, and the
+  in-memory token set is simply empty.
+- Clients re-run OAuth once and everything looks healthy again.
+- `persistTokens` then fails with `EACCES` — a single `WARN` line — so the new token
+  lives in memory only, and the next restart repeats the whole cycle.
+
+Only an explicit permission check surfaced it. Ownership drift is therefore treated as
+a first-class failure here, not as an operator mistake to document away.
+
+### Guards
+
+`lib/state-ownership.mjs` holds both, and both are inert in the normal non-root case:
+
+1. **Ownership-preserving writes.** `writeFilePreservingOwner` stats the file first; if
+   the process is root and the file already belonged to someone else, it restores that
+   owner after writing. A root-run upgrade cannot orphan the service account's state.
+   A failed `chown` is reported, never thrown — the data is already on disk.
+2. **Boot-time inspection.** `stateOwnershipWarnings` classifies every state path
+   (missing / ok / foreign owner / unreadable / unwritable / loose mode) and the server
+   logs one `WARN:` per unhealthy path at startup, each naming the `chown` that fixes
+   it.
+
+Neither guard can repair a rewrite performed behind the bridge's back while it is not
+running — that is what the README's Linux install rules are for: root installs the
+code, the service account owns the state.
+
+---
+
 ## Related files
 
 | Path | Role |
@@ -252,5 +296,6 @@ documented in the README (capability toolsets / CLI allowlist).
 | `lib/security-core.mjs` | Pure auth/CLI argv helpers (testable) |
 | `lib/cli-policy.mjs` | Opt-in `action=cli` allowlist |
 | `lib/toolsets.mjs` | Capability tiers status/dispatch/admin |
+| `lib/state-ownership.mjs` | State-file ownership guards (root-safe writes, boot check) |
 | `COORDINATOR.md` | Operator discipline (also `action=guide`) |
 | `README.md` | Install, env, security model |

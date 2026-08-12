@@ -7,18 +7,25 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# Edit User/Group/paths for your host.
-# User/Group `orca` is the recommended dedicated service account for this unit.
+# Dedicated service account. Every user-ish setting below must agree with these
+# two lines: the bridge's state (OAuth tokens, sender pins, audit log) is written
+# into this account's HOME and must stay owned by it. See README § Linux.
 User=orca
 Group=orca
+# Any directory the service account can read — state does NOT go here.
 WorkingDirectory=/opt/orca-mcp
-# HOME/PATH must match the service account home on your host (replace USER).
-Environment=HOME=/home/USER
-Environment=PATH=/home/USER/.local/bin:/usr/local/bin:/usr/bin:/bin
+# MUST be the home of User= above (replace `orca` if you renamed the account).
+# If HOME belongs to a different account, the bridge writes tokens somewhere it
+# may not own and clients re-authorize after every restart.
+Environment=HOME=/home/orca
+Environment=PATH=/home/orca/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Plain KEY=VALUE env file (mode 600). Token/origin stay on the host, not in git.
 EnvironmentFile=/etc/orca-mcp/env
 # Long-running node directly — not run.sh/nohup (those exit after start).
+# Checkout install (repo owned by the service account):
 ExecStart=/usr/bin/node /opt/orca-mcp/server.mjs --port 8787
+# Global npm install instead? Swap the line above for:
+#   ExecStart=/usr/bin/orca-mcp --port 8787
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=orca-bridge

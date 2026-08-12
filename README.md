@@ -355,17 +355,14 @@ Expect `statusProbe.ok: true` and a `bridge.version`.
 Raw `worktree create --agent --prompt` is **rejected** (`forbidden_handoff`). Use the action API:
 
 ```text
-dispatch → await(≤45s)×N [honor liveness] → worker_done → release(dispatchId, terminalHandle) → read-only
+health → dispatch → await(≤45s)×N → worker_done → release(dispatchId, terminalHandle) → read-only
 ```
-
-Runtime/version gates run **lazily** inside `dispatch` / `await` / `release` (self-diagnosing errors). `health` is optional compact diagnostics (`verbose:true` for the full dump).
 
 | `await` summary.status | Meaning |
 | --- | --- |
-| empty / timeout (active\|idle) | Re-call `await` — normal early; watch `liveness` |
-| empty + liveness=stalled | Stop-condition: peek → ping → release + report |
+| empty / timeout | Re-call `await` — normal |
 | question | Reply via `cli` → `orchestration reply`, then await + ack |
-| escalation | Reply via `cli` → `orchestration reply` (dual-routes onto `dispatch:<id>`), then await + ack; prefer `ask` for back-and-forth |
+| escalation | Read body; answer / re-task / fail; always ack |
 | worker_done | `release` with `dispatchId` + worker `terminalHandle` |
 
 Full discipline: tool description, `action=guide`, and [`COORDINATOR.md`](./COORDINATOR.md).
@@ -376,7 +373,7 @@ Example wave:
 // 1. start work
 { "action": "dispatch", "spec": "…", "repo": "path:/path/to/repo", "agent": "omp" }
 
-// 2. poll until worker_done (repeat; honor liveness on empty)
+// 2. poll until worker_done (repeat)
 { "action": "await", "runId": "<from dispatch>", "waitMs": 45000 }
 
 // 3. cleanup
@@ -408,10 +405,17 @@ Example wave:
 | `--read-only` | CLI flag equivalent to `ORCA_BRIDGE_TOOLSETS=status` (wins over the env var) |
 | `--stdio` | CLI flag. Select stdio transport instead of Streamable HTTP |
 
-State files (mode `600` where applicable):
+State files (mode `600` where applicable) — all under the `HOME` of the account the
+bridge runs as, and **all must be owned by that account** (see
+[Linux deploy](#linux-cli-only--headless)):
 
 - `~/.orca-bridge-tokens.json` — issued OAuth access tokens  
 - `~/.orca-bridge-sender-pins.json` — durable per-client sender pins  
+- `~/.orca-bridge/` (dir `700`) — audit log; override with `ORCA_BRIDGE_AUDIT_DIR`  
+
+The bridge writes these ownership-preserving (a write performed as root restores the
+previous owner) and logs a `WARN:` at boot for any state file it cannot read or write,
+or that belongs to another account.
 
 ---
 
@@ -496,9 +500,74 @@ Installs a user LaunchAgent (`com.orca-mcp.bridge`), runtime dir `~/.orca-bridge
 
 ### Linux (CLI-only / headless)
 
-1. Clone this repo to a **durable** path (not an ephemeral Orca worktree).
-2. Copy `deploy/linux/orca-bridge.service` → `/etc/systemd/system/`, edit `User`, `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths.
-3. Put secrets in the env file (mode 600):
+**The one rule:** root may install the *code*; the **service account owns the *state***.
+The bridge keeps its OAuth tokens, sender pins and audit log in the `HOME` of the
+account the unit runs as. Anything that writes those files while running as root —
+`sudo node server.mjs`, a root-run upgrade or migration script — replaces them with
+`root:0600` inodes, and the service account then loses both read and write on its own
+state. Nothing crashes: the bridge answers normally, but tokens issued afterwards live
+in memory only and the next restart drops every MCP client back to a fresh OAuth flow.
+See [Troubleshooting: tokens do not survive restart](#troubleshooting-tokens-do-not-survive-restart).
+
+Below, `orca` is the dedicated service account. Substitute your own.
+
+#### 1. Service account
+
+```bash
+# Skip if the account already exists.
+sudo useradd --system --create-home --shell /usr/sbin/nologin orca
+```
+
+#### 2. Install the code
+
+Pick one. Both are fine; they differ only in *who owns the files on disk*.
+
+**A. Checkout owned by the service account** (no registry, no root in the install step):
+
+```bash
+sudo install -d -o orca -g orca /opt/orca-mcp
+sudo -u orca git clone https://github.com/BuildContext/orca-mcp.git /opt/orca-mcp
+# zero runtime dependencies — nothing to npm install
+```
+
+`ExecStart=/usr/bin/node /opt/orca-mcp/server.mjs --port 8787`
+
+**B. Global npm install** (root-owned binary, shared across accounts):
+
+```bash
+sudo npm i -g orca-mcp@0.3.0     # → /usr/lib/node_modules/orca-mcp, root:root
+sudo -u orca orca-mcp --version  # prove the service account can execute it
+```
+
+`ExecStart=/usr/bin/orca-mcp --port 8787`
+
+Root owning the *binary* is correct here — it is read-only, executable by everyone,
+and no state lives next to it. What must **never** happen is running the bridge itself
+(or a migration touching `~/.orca-bridge-*`) as root. `npm i -g` under `sudo` does not
+create bridge state, so it is safe; `sudo orca-mcp --port 8787` is not.
+
+> Do **not** `sudo npm i -g` into the *service account's* npm prefix, and do not run
+> `npm i -g` as `orca` into a root-owned prefix. Either mixes owners inside one tree.
+
+#### 3. Unit file
+
+Copy `deploy/linux/orca-bridge.service` → `/etc/systemd/system/`, then edit:
+
+| field | value |
+|-------|-------|
+| `User` / `Group` | the service account (`orca`) |
+| `Environment=HOME=` | **that account's home** (`/home/orca`) — this is where state lands |
+| `WorkingDirectory` | any directory the account can read |
+| `EnvironmentFile` | the env file from step 4 |
+| `ExecStart` | from step 2 (A or B) |
+
+`HOME` must match `User`. If they disagree, the bridge writes its state into a home
+directory belonging to someone else, and you get the same lockout by a different route.
+
+#### 4. Secrets
+
+Env file, mode `600`, owned by root or by the service account (systemd reads it before
+dropping privileges; the bridge never writes to it):
 
 ```bash
 ORCA_BRIDGE_TOKEN=…
@@ -509,11 +578,63 @@ ORCA_CLI_COMMAND=orca-ide   # if that is your binary name
 # ORCA_BRIDGE_CLI_HARDENING=1
 ```
 
-4. `systemctl enable --now orca-bridge.service`  
-5. Logs: `journalctl -u orca-bridge.service -n 50`
+#### 5. Start and verify ownership
 
-Scripts `run.sh` / `watchdog.sh` / `verify-runtime.sh` are optional host helpers; set `ORCA_BRIDGE_SERVER` to your checkout’s `server.mjs`.
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now orca-bridge.service
+journalctl -u orca-bridge.service -n 50
+```
 
+After the first OAuth pairing, confirm the invariant — every path must be owned by the
+service account, mode `600` (dir `700`):
+
+```bash
+sudo ls -l  /home/orca/.orca-bridge-tokens.json /home/orca/.orca-bridge-sender-pins.json
+sudo ls -ld /home/orca/.orca-bridge
+sudo find /home/orca -user root        # must print nothing
+```
+
+The bridge itself checks this at boot and logs a `WARN:` line per bad path, so
+`journalctl -u orca-bridge.service | grep WARN` is the short version.
+
+#### Upgrades
+
+Upgrade the code however you installed it (`sudo -u orca git pull`, or
+`sudo npm i -g orca-mcp@<version>`), then `sudo systemctl restart orca-bridge.service`.
+Never point a root shell at `~/.orca-bridge-*`. If some script must, it has to restore
+the previous owner afterwards (`chown --reference=` or a stat/chown pair) — the bridge
+does this for its own writes, but it cannot fix a rewrite done behind its back.
+
+Pairing survives a restart: `~/.orca-bridge-tokens.json` is re-read at boot, so no
+client should have to re-authorize after an upgrade. If one does, the state files
+changed owner — see the troubleshooting entry below.
+
+`deploy/linux/run.sh` is an optional manual/watchdog launcher (systemd is the production
+path); set `ORCA_BRIDGE_SERVER` to your `server.mjs`. Run it **as the service account** —
+under `sudo` it produces exactly the root-owned state this section is about.
+
+#### Troubleshooting: tokens do not survive restart
+
+Symptom: the bridge is up and answering, but an MCP client that was already paired has
+to run the OAuth flow again — and after the *next* restart, again. Journal shows
+`WARN: cannot persist tokens: EACCES` or a boot `WARN:` about
+`~/.orca-bridge-tokens.json`.
+
+Cause: the token store is owned by another account (almost always `root`, from an
+install/migration step run under `sudo`). Diagnose and fix:
+
+```bash
+sudo ls -l /home/orca/.orca-bridge-tokens.json     # owner is root → this is it
+sudo chown orca:orca /home/orca/.orca-bridge-tokens.json
+sudo chmod 600 /home/orca/.orca-bridge-tokens.json
+sudo systemctl restart orca-bridge.service
+```
+
+Also check the sibling paths (`~/.orca-bridge-sender-pins.json`, `~/.orca-bridge/`);
+the same step usually touched all of them. Ownership and mode are the only fix needed —
+the file contents stay valid, so already-issued tokens keep working and clients paired
+before the incident do not need to re-pair.
 
 ---
 
@@ -544,6 +665,7 @@ lib/toolsets.mjs               # capability tiers + gate
 lib/cli-policy.mjs             # action=cli allowlist policy
 lib/security-core.mjs          # pure security helpers
 lib/audit.mjs                  # annotations + audit resources
+lib/state-ownership.mjs        # state-file ownership guards (root-safe writes, boot check)
 lib/orch-isolation.mjs         # multi-coordinator isolation helpers + unit tests
 lib/stdio-transport.test.mjs   # stdio + HTTP smoke (node --test)
 scripts/docs.mjs               # npm run docs:build / docs:check
