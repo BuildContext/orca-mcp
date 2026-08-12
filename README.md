@@ -413,8 +413,8 @@ bridge runs as, and **all must be owned by that account** (see
 - `~/.orca-bridge-sender-pins.json` — durable per-client sender pins  
 - `~/.orca-bridge/` (dir `700`) — audit log; override with `ORCA_BRIDGE_AUDIT_DIR`  
 
-The bridge writes these ownership-preserving (a write performed as root restores the
-previous owner) and logs a `WARN:` at boot for any state file it cannot read or write,
+The bridge writes these ownership-preserving (a write performed as root keeps the file
+with the account that owns the state) and logs a `WARN:` at boot for any state file it cannot read or write,
 or that belongs to another account.
 
 ---

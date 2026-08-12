@@ -272,10 +272,17 @@ a first-class failure here, not as an operator mistake to document away.
 
 `lib/state-ownership.mjs` holds both, and both are inert in the normal non-root case:
 
-1. **Ownership-preserving writes.** `writeFilePreservingOwner` stats the file first; if
-   the process is root and the file already belonged to someone else, it restores that
-   owner after writing. A root-run upgrade cannot orphan the service account's state.
+1. **Ownership-preserving writes.** `writeFilePreservingOwner` stats the target first.
+   Running as root over a file that belonged to the service account, it restores that
+   owner after writing — this is the case a migration's `os.replace()` creates, since a
+   fresh inode belongs to whoever wrote it. Writing a file that does not exist yet, it
+   falls back to the owner of the containing directory (the service account's HOME), so
+   a root-run first write cannot orphan the store either. Non-root writes chown nothing.
    A failed `chown` is reported, never thrown — the data is already on disk.
+
+   Note the one case that is *not* a bug: a plain `writeFileSync` over an existing file
+   truncates the inode in place and leaves its owner alone, even under root. The damage
+   in NAS-241 came from the atomic replace, not from the write itself.
 2. **Boot-time inspection.** `stateOwnershipWarnings` classifies every state path
    (missing / ok / foreign owner / unreadable / unwritable / loose mode) and the server
    logs one `WARN:` per unhealthy path at startup, each naming the `chown` that fixes
