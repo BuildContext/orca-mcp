@@ -272,12 +272,14 @@ a first-class failure here, not as an operator mistake to document away.
 
 `lib/state-ownership.mjs` holds both, and both are inert in the normal non-root case:
 
-1. **Ownership-preserving writes.** `writeFilePreservingOwner` stats the target first.
-   Running as root over a file that belonged to the service account, it restores that
-   owner after writing — this is the case a migration's `os.replace()` creates, since a
-   fresh inode belongs to whoever wrote it. Writing a file that does not exist yet, it
-   falls back to the owner of the containing directory (the service account's HOME), so
-   a root-run first write cannot orphan the store either. Non-root writes chown nothing.
+1. **Ownership-preserving writes.** `writeFilePreservingOwner` stats the target first
+   and decides who *should* own the result. A file owned by a normal account keeps that
+   owner. A file that is missing — or already `root`-owned inside someone else's home,
+   which is exactly what a migration's `os.replace()` leaves behind — is handed to the
+   owner of the containing directory, i.e. the service account's HOME. So the guard
+   both prevents the damage and repairs it on the next write, rather than cementing a
+   root-owned store. A root-owned file in a root-owned home is left alone, and non-root
+   writes chown nothing.
    A failed `chown` is reported, never thrown — the data is already on disk.
 
    Note the one case that is *not* a bug: a plain `writeFileSync` over an existing file
