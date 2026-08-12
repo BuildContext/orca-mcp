@@ -2,7 +2,7 @@
 
 **Branch:** `BuildContext/nas-247-ownership-gate`  
 **Date:** 2026-08-12  
-**Status:** Implemented + tests green (267/267). Not merged. Hardening default unchanged (NAS-227).
+**Status:** Implemented + argv-edge tests + NAS-227 no-handle note. Not merged. Hardening default unchanged (NAS-227).
 
 ## Summary
 
@@ -15,8 +15,8 @@ The cli allowlist matched subcommand prefixes only. `terminal read` / `close` / 
 | `lib/state-ownership.mjs` | Added `HANDLE_OWNED` / `HANDLE_NOT_OWNED` / `HANDLE_UNKNOWN`, `normalizeTerminalHandle`, `getTerminalHandle`, `collectTerminalHandleSets`, `listOwnedTerminalHandles`, `resolveTerminalHandleOwnership` |
 | `lib/cli-policy.mjs` | Added `OWNERSHIP_GATED_PREFIXES`, `extractTerminalHandleFromArgv`, `isOwnershipGatedArgv`, `ownershipDecision`; threaded optional `ownershipCheck` through `createCliPolicy` / `evaluateCliArgv` |
 | `server.mjs` | Import resolver; pass `ownershipCheck` closure into `createCliPolicy` using `currentClientKey()` + live `dispatchRegistry` / `clientOwnership` / `senderCaches` / `coordinatorHandles` |
-| `lib/state-ownership.test.mjs` | Resolver unit tests: owned, not-owned, unknown, missing registry, malformed handle |
-| `lib/cli-policy.test.mjs` | Funnel tests: deny under hardening, `allow_with_warning` when off, read/close/send, positive owned path |
+| `lib/state-ownership.test.mjs` | Resolver unit tests + first-vs-last `--terminal`, positional ignore, empty/whitespace, wrong-prefix, foreign client |
+| `lib/cli-policy.test.mjs` | Funnel tests + argv-shape edges (case, leading flags, `--`, extras, positional, empty/dup `--terminal`, no-handle) |
 
 ## How ownership is resolved
 
@@ -79,7 +79,7 @@ Permissive warning uses the same `code: 'handle_not_owned'` (not `cli_policy_wou
 ## Tests
 
 ```
-npm test → 267 pass, 0 fail, 0 skipped
+npm test → 285 pass, 0 fail, 0 skipped
 assertTierMappingInvariants → []
 ```
 
@@ -113,6 +113,10 @@ Once **NAS-227** turns hardening on by default, any `action=cli` that targets a 
 - `cli terminal read/close/send` against this client’s pinned sender or `registerOwnedDispatch` worker handles.
 - `terminal list` (no handle) — not ownership-gated.
 
+### Known back-compat: `terminal read` without `--terminal`
+
+Once **NAS-227** turns `ORCA_BRIDGE_CLI_HARDENING=1` on by default, `terminal read` (and `close` / `send`) **without** an explicit `--terminal <handle>` becomes fail-closed at the ownership gate: extractors return null, the resolver reports `unknown` / `missing_or_malformed_handle`, and the funnel denies (or `allow_with_warning` while hardening is still off). That matches today’s Orca CLI note that omitting `--terminal` targets the active worktree terminal — a handle the bridge never saw in `--terminal` form and therefore cannot treat as owned. NAS-227’s acceptance step must exercise this no-handle shape on both contours (VM `orca-server-1` and the Mac reserve), not only the foreign-handle deny path.
+
 ## Non-goals confirmed
 
 - Did **not** change `ORCA_BRIDGE_CLI_HARDENING` default.
@@ -128,5 +132,5 @@ None in ticket scope. Design was unambiguous: ownership lives in existing `clien
 
 ```bash
 npm test
-# tests 267, pass 267, fail 0
+# tests 285, pass 285, fail 0
 ```
