@@ -59,12 +59,6 @@ import {
   tokenMatches as tokenMatchesCore,
   extractBearer,
   injectSenderArgv,
-  parseOrchestrationReplyArgv,
-  resolveWorkerDispatchId,
-  buildEscalationReplyFollowupSendArgv,
-  replyEnvelopeIsQuestionAnswer,
-  isStaleDeliveryError,
-  explainStaleDeliveryError,
 } from './lib/security-core.mjs';
 import {
   createCliPolicy,
@@ -79,20 +73,6 @@ import {
   buildWaitMsPropertyDescription,
 } from './lib/coordinator-doctrine.mjs';
 import {
-  versionGte,
-  RuntimeGuardError,
-  createRuntimeProbeCache,
-  assertRuntimeReady,
-  compactHealthPayload,
-  computeLiveness,
-  nextStepForLiveness,
-  pickLastActivityAt,
-  isDeadRuntimeSignal,
-  deadRuntimeFailure,
-  HEALTH_DIAGNOSTICS_HINT,
-} from './lib/runtime-guard.mjs';
-
-import {
   ORCA_TOOL_ANNOTATIONS,
   ACTION_ANNOTATIONS,
   ORCA_OUTPUT_SCHEMA,
@@ -104,6 +84,11 @@ import {
   resolveOrcaAction,
   redactValue,
 } from './lib/audit.mjs';
+import {
+  STATE_FILE_MODE,
+  stateOwnershipWarnings,
+  writeFilePreservingOwner,
+} from './lib/state-ownership.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -270,7 +255,15 @@ function persistSenderPin(clientKey, { handle, title, source } = {}) {
     at: new Date().toISOString(),
   };
   try {
-    fs.writeFileSync(SENDER_PIN_STORE, JSON.stringify(all), { mode: 0o600 });
+    // Ownership-preserving: a root-run upgrade must not orphan the service
+    // account's pin store (see lib/state-ownership.mjs, NAS-241).
+    const res = writeFilePreservingOwner(SENDER_PIN_STORE, JSON.stringify(all), {
+      mode: STATE_FILE_MODE,
+    });
+    if (res.chownError) {
+      console.error(`WARN: sender pin store owner not restored (${res.chownError}); ` +
+        `chown it back to the service user or the bridge loses its pins after restart`);
+    }
   } catch (e) {
     console.error('WARN: cannot persist sender pin:', e.message);
   }
@@ -290,9 +283,7 @@ const WORKER_CONTRACT_MARKER = '<!-- orca-bridge-worker-contract -->';
 const WORKER_CONTRACT_BLOCK =
   `${WORKER_CONTRACT_MARKER}\n` +
   'On completion: emit exactly one worker_done with --outcome succeeded|failed and a concise 3-sentence body. ' +
-  'Do not close the terminal yourself — the coordinator releases it.\n' +
-  'For a blocking coordinator answer use orchestration ask (not send --type escalation + check). ' +
-  'Escalation notifies the coordinator; a bridge dual-routes reply onto dispatch:<id> so worker check can see it.\n';
+  'Do not close the terminal yourself — the coordinator releases it.\n';
 
 /**
  * Append the supervised completion contract unless already present.
@@ -306,8 +297,22 @@ function withWorkerContract(spec) {
 }
 
 
-// versionGte / parseSemver live in lib/runtime-guard.mjs (unit-tested).
+function parseSemver(v) {
+  const m = String(v || '').trim().match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
 
+function versionGte(a, b) {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return false;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] > pb[i]) return true;
+    if (pa[i] < pb[i]) return false;
+  }
+  return true;
+}
 
 /** Long discipline docs for coordinators (also generated into COORDINATOR.md). */
 function coordinatorGuide() {
@@ -327,9 +332,6 @@ if (!TOKEN || TOKEN.length < 16) {
 }
 const HINDSIGHT_URL = new URL(process.env.HINDSIGHT_URL || 'http://127.0.0.1:8888');
 const startedAt = Date.now();
-/** Lazy runtime probe cache (NAS-246) — TTL'd status for dispatch/await/release. */
-const runtimeProbeCache = createRuntimeProbeCache();
-
 
 // Public origin for OAuth discovery/endpoints. Set to the Funnel host.
 // When unset, endpoints are built from the request Host header.
@@ -356,8 +358,18 @@ try {
   if (fs.existsSync(TOKEN_STORE)) issuedTokens = new Set(JSON.parse(fs.readFileSync(TOKEN_STORE, 'utf8')));
 } catch { /* empty / unreadable store */ }
 function persistTokens() {
-  try { fs.writeFileSync(TOKEN_STORE, JSON.stringify([...issuedTokens]), { mode: 0o600 }); }
-  catch (e) { console.error('WARN: cannot persist tokens:', e.message); }
+  try {
+    // Ownership-preserving write: if this process is root (upgrade script,
+    // migration) the store must stay owned by the service user, otherwise the
+    // unit silently loses read+write on its own tokens (NAS-241).
+    const res = writeFilePreservingOwner(TOKEN_STORE, JSON.stringify([...issuedTokens]), {
+      mode: STATE_FILE_MODE,
+    });
+    if (res.chownError) {
+      console.error(`WARN: token store owner not restored (${res.chownError}); ` +
+        `run \`chown\` back to the service user or clients will need to re-authorize`);
+    }
+  } catch (e) { console.error('WARN: cannot persist tokens:', e.message); }
 }
 function pruneCodes() {
   const now = Date.now();
@@ -504,53 +516,6 @@ function describeRun(run, wantJson) {
   return out;
 }
 
-/**
- * Lazy runtime/version gate for dispatch/await/release (NAS-246).
- * Uses TTL cache so waves do not re-probe every call.
- * Throws RuntimeGuardError with code/reason/recovery.
- */
-async function ensureRuntimeReady({ force = false } = {}) {
-  // Bridge process version is local — always check, no I/O.
-  assertRuntimeReady({ version: VERSION, minVersion: MIN_BRIDGE_VERSION });
-
-  if (!force) {
-    const cached = runtimeProbeCache.get();
-    if (cached) {
-      assertRuntimeReady({ version: VERSION, minVersion: MIN_BRIDGE_VERSION, probe: cached });
-      return cached;
-    }
-  }
-
-  const run = await runOrca(['status', '--json'], { timeoutMs: 15_000 });
-  const probe = describeRun(run, true);
-  // Cache both success and failure briefly so a dead runtime does not stampede.
-  runtimeProbeCache.set(probe);
-  assertRuntimeReady({ version: VERSION, minVersion: MIN_BRIDGE_VERSION, probe });
-  return probe;
-}
-
-/** Best-effort map RuntimeGuardError (or unknown) to a structured tool result. */
-function runtimeGuardRejection(err) {
-  if (err instanceof RuntimeGuardError) return err.toJSON();
-  return {
-    ok: false,
-    error: {
-      code: 'runtime_unavailable',
-      message: String(err?.message || err),
-      reason: String(err?.message || err),
-      recovery: `Retry once; if it persists, ${HEALTH_DIAGNOSTICS_HINT}`,
-    },
-    next: { action: 'diagnose', detail: 'Unexpected runtime error before supervised action.' },
-  };
-}
-
-/** Prefer structured runtime_unavailable when a step shows a dead CLI/runtime. */
-function maybeDeadRuntime(described, ctx = {}) {
-  if (!isDeadRuntimeSignal(described)) return null;
-  return deadRuntimeFailure(described, ctx);
-}
-
-
 // --- Helpers: orchestration envelopes ---------------------------------------
 function envOk(described) {
   return described && described.ok === true && described.envelope;
@@ -619,7 +584,7 @@ function summarizeMessages(messages = []) {
   };
 }
 
-function nextStepForAwait(summary, { timedOut, deliveryId, livenessInfo = null } = {}) {
+function nextStepForAwait(summary, { timedOut, deliveryId }) {
   // next.action is a HINT — summary.status wins if they disagree.
   if (summary.status === 'worker_done') {
     return {
@@ -647,31 +612,24 @@ function nextStepForAwait(summary, { timedOut, deliveryId, livenessInfo = null }
     };
   }
   if (summary.status === 'escalation') {
-    const eid = summary.escalation?.id || '<escalation.id>';
     return {
-      action: 'reply_then_ack',
+      action: 'handle_escalation',
       detail:
-        'summary.status=escalation. Reply: orca{action:"cli",args:["orchestration","reply","--id","' +
-        eid +
-        '","--body","<answer>","--json"]} ' +
-        '(bridge dual-routes non-question replies onto dispatch:<id> so the waiting worker unblocks). ' +
-        'Then await with ack=deliveryId. Prefer ask for true back-and-forth.',
+        'summary.status=escalation. Read body; decide (cli terminal send / new dispatch / fail). ' +
+        'Always ack deliveryId on next await. Do not stay silent.',
       deliveryId: deliveryId || null,
-      escalationId: summary.escalation?.id || null,
-      reply_argv: ['orchestration', 'reply', '--id', String(eid), '--body', '<answer>', '--json'],
       note: 'next.action is a hint; prefer summary.status if they disagree.',
     };
   }
   if (timedOut || summary.status === 'empty') {
-    if (livenessInfo && livenessInfo.liveness) {
-      return nextStepForLiveness({
-        liveness: livenessInfo.liveness,
-        emptyWindowsConsecutive: livenessInfo.emptyWindowsConsecutive,
-        msSinceActivity: livenessInfo.msSinceActivity,
-        deliveryId: null,
-      });
-    }
-    return nextStepForLiveness({ liveness: 'unknown', emptyWindowsConsecutive: 0, deliveryId: null });
+    return {
+      action: 'await',
+      detail:
+        'Empty/timeout window — NORMAL for 15–60 min tasks. Re-call orca{action:"await",runId,waitMs:45000} ' +
+        '(no ack unless you have a prior deliveryId to acknowledge). Not a failure; do not restart the worker.',
+      deliveryId: null,
+      note: 'next.action is a hint; prefer summary.status if they disagree.',
+    };
   }
   return {
     action: 'process_messages',
@@ -680,128 +638,6 @@ function nextStepForAwait(summary, { timedOut, deliveryId, livenessInfo = null }
     note: 'next.action is a hint; prefer summary.status if they disagree.',
   };
 }
-
-/**
- * NAS-239: after a successful non-question orchestration reply, dual-route the
- * body onto dispatch:<id>. Orca's native reply targets the worker terminal
- * handle with type=status; workers with an active Dispatch read dispatch:<id>.
- * Question answers already land on dispatch via question_threads — skip those.
- */
-async function dualRouteNonQuestionReply(argv, replyDescribed) {
-  const parsed = parseOrchestrationReplyArgv(argv);
-  if (!parsed || !parsed.ok) return null;
-  if (!replyDescribed || replyDescribed.ok === false) return null;
-  const env = replyDescribed.envelope || {};
-  if (env.ok === false) return null;
-  if (replyEnvelopeIsQuestionAnswer(env)) {
-    return { skipped: true, reason: 'question_answer_already_on_dispatch' };
-  }
-
-  const result = env.result && typeof env.result === 'object' ? env.result : env;
-  const replyMessage = result.message || result;
-
-  // Prefer payload/dispatch on the original escalation (inbox / worker-show).
-  let originalMessage = null;
-  try {
-    const inbox = await runJson(
-      ['orchestration', 'inbox', '--full', '--limit', '100', '--json'],
-      { timeoutMs: 20_000 },
-    );
-    const messages =
-      inbox.envelope?.result?.messages ||
-      inbox.envelope?.messages ||
-      inbox.envelope?.result ||
-      [];
-    if (Array.isArray(messages)) {
-      originalMessage =
-        messages.find((m) => pick(m, 'id', 'messageId', 'message_id') === parsed.id) || null;
-    }
-  } catch {
-    /* best-effort */
-  }
-
-  let workers = [];
-  try {
-    const listed = await runJson(['orchestration', 'worker-list', '--json'], { timeoutMs: 20_000 });
-    workers =
-      listed.envelope?.result?.workers ||
-      listed.envelope?.workers ||
-      [];
-    if (!Array.isArray(workers)) workers = [];
-  } catch {
-    workers = [];
-  }
-
-  const dispatchId = resolveWorkerDispatchId({
-    originalMessage,
-    replyMessage,
-    workers,
-  });
-  if (!dispatchId) {
-    return {
-      skipped: true,
-      reason: 'dispatch_id_unresolved',
-      reply_to: pick(replyMessage, 'to_handle', 'to') || null,
-      original_id: parsed.id,
-    };
-  }
-
-  // If native reply already targeted dispatch:<id>, do not double-send.
-  const nativeTo = String(pick(replyMessage, 'to_handle', 'to') || '');
-  if (nativeTo === `dispatch:${dispatchId}` || nativeTo === dispatchId) {
-    return { skipped: true, reason: 'native_reply_already_on_dispatch', dispatchId };
-  }
-
-  const subject =
-    pick(replyMessage, 'subject', 'title') ||
-    (originalMessage
-      ? `Re: ${pick(originalMessage, 'subject', 'title') || 'escalation'}`
-      : 'Re: escalation');
-  const threadId =
-    pick(replyMessage, 'thread_id', 'threadId') ||
-    pick(originalMessage || {}, 'thread_id', 'threadId', 'id') ||
-    parsed.id;
-  const body =
-    parsed.body != null
-      ? parsed.body
-      : pick(replyMessage, 'body', 'text', 'content') || '';
-  const runId =
-    parsed.run ||
-    pick(replyMessage, 'run_id', 'runId') ||
-    pick(originalMessage || {}, 'run_id', 'runId') ||
-    null;
-  const from =
-    parsed.from ||
-    pick(replyMessage, 'from_handle', 'from') ||
-    null;
-
-  const sendArgv = buildEscalationReplyFollowupSendArgv({
-    dispatchId,
-    body,
-    subject,
-    threadId,
-    runId,
-    from: from && String(from).startsWith('run:') ? null : from,
-  });
-  const sendDescribed = await runJson(sendArgv, { timeoutMs: 30_000 });
-  return {
-    dual_routed: sendDescribed.ok !== false && sendDescribed.envelope?.ok !== false,
-    dispatchId,
-    send: sendDescribed.envelope || sendDescribed,
-    reason: 'worker_dispatch_mailbox',
-  };
-}
-
-function staleFromDescribed(described, ackId) {
-  const env = described?.envelope || {};
-  const err = env.error || {};
-  return explainStaleDeliveryError({
-    ackId,
-    errorCode: err.code,
-    errorMessage: err.message || err.code,
-  });
-}
-
 
 
 /**
@@ -1143,12 +979,6 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent }) {
  *   → orchestration dispatch --inject → liveness probe → terminal send recovery if idle
  */
 async function dispatchWorker(args = {}) {
-
-  try {
-    await ensureRuntimeReady();
-  } catch (e) {
-    return runtimeGuardRejection(e);
-  }
   const rawSpec = String(args.spec || '').trim();
   if (!rawSpec) throw new Error('spec is required (worker brief)');
   // Bridge enforces worker_done contract so system prompts need not repeat it.
@@ -1178,17 +1008,12 @@ async function dispatchWorker(args = {}) {
     );
     steps.push({ step: 'run-create', ...created });
     if (!envOk(created)) {
-      const dead = maybeDeadRuntime(created, { stage: 'run-create' });
-      if (dead) return { ...dead, steps };
       return {
         ok: false,
         stage: 'run-create',
         error: 'run-create failed',
         steps,
-        next: {
-          action: 'fix',
-          detail: `Check Orca runtime / orchestration experimental. ${HEALTH_DIAGNOSTICS_HINT}`,
-        },
+        next: { action: 'fix', detail: 'Check Orca runtime / orchestration experimental.' },
       };
     }
     runId = pick(created.envelope?.result?.run, 'id') || pick(created.envelope?.result, 'runId', 'id');
@@ -1435,12 +1260,8 @@ async function dispatchWorker(args = {}) {
       agent,
       worktree: worktreePath || null,
       name: name || null,
-      dispatchedAt: new Date().toISOString(),
-      lastActivityAt: new Date().toISOString(),
-      emptyWindowsConsecutive: 0,
     });
   }
-
 
   return {
     ok: true,
@@ -1473,11 +1294,6 @@ async function dispatchWorker(args = {}) {
 }
 
 async function awaitDispatch(args = {}) {
-  try {
-    await ensureRuntimeReady();
-  } catch (e) {
-    return runtimeGuardRejection(e);
-  }
   const runId = String(args.run_id || '').trim();
   if (!runId) throw new Error('run_id is required');
   const waitMs = Math.min(Math.max(args.wait_ms ?? CHECK_WAIT_DEFAULT_MS, 0), CHECK_WAIT_MAX_MS);
@@ -1541,7 +1357,6 @@ async function awaitDispatch(args = {}) {
     /consumer_fenced|not run_|fenced consumer|no longer bound/i.test(
       String(env.error?.message || env.error?.code || ''),
     );
-  let staleInfo = ack ? staleFromDescribed(described, ack) : null;
 
   // Stale in-memory bind (stolen by another client, or process disagreed with runtime):
   // rebind once; drop ack if any.
@@ -1562,59 +1377,14 @@ async function awaitDispatch(args = {}) {
       /consumer_fenced|not run_|fenced consumer|no longer bound/i.test(
         String(env.error?.message || env.error?.code || ''),
       );
-    staleInfo = null;
-  } else if (staleInfo && ack) {
-    // msg_… ack or foreign/expired deliveryId — drop and retry once without ack.
-    ackDropped = {
-      deliveryId: ack,
-      reason: staleInfo.hint || 'stale_delivery',
-      detail: staleInfo.message,
-    };
-    ack = null;
-    described = await runJson(buildCheckArgv(null), { timeoutMs: waitMs + 30_000 });
-    env = described.envelope || {};
-    fence =
-      env.error?.code === 'consumer_fenced' ||
-      /consumer_fenced|not run_|fenced consumer|no longer bound/i.test(
-        String(env.error?.message || env.error?.code || ''),
-      );
-    staleInfo = staleFromDescribed(described, ackDropped.deliveryId);
-    // If retry still stale with no ack, clear — shouldn't happen without ack.
-    if (!ack) staleInfo = null;
   }
 
-  if ((!described.envelope && described.ok === false) || fence || (env.error && isStaleDeliveryError(env.error?.code, env.error?.message))) {
-    const stillStale = staleFromDescribed(described, ackDropped?.deliveryId || args.ack);
-    if (!fence && !stillStale) {
-      const dead = maybeDeadRuntime(described, { stage: 'await-check', runId });
-      if (dead) {
-        return {
-          ...dead,
-          window_ms: waitMs,
-          client_key: currentClientKey(),
-          sender_handle: sender.handle,
-          run_use: useRes?.envelope || useRes || null,
-          run_use_skipped: runUseSkipped || undefined,
-          ack_dropped: ackDropped || undefined,
-          raw: described,
-        };
-      }
-    }
+  if ((!described.envelope && described.ok === false) || fence) {
     return {
       ok: false,
       run_id: runId,
       window_ms: waitMs,
-      error: fence
-        ? 'consumer_fenced'
-        : stillStale
-          ? 'stale_delivery'
-          : 'check failed',
-      errorCode: fence
-        ? 'consumer_fenced'
-        : stillStale
-          ? 'stale_delivery'
-          : 'check_failed',
-      error_detail: stillStale || undefined,
+      error: fence ? 'consumer_fenced' : 'check failed',
       client_key: currentClientKey(),
       sender_handle: sender.handle,
       run_use: useRes?.envelope || useRes || null,
@@ -1623,14 +1393,11 @@ async function awaitDispatch(args = {}) {
       raw: described,
       next: {
         action: 'retry_await_without_ack_once',
-        detail: stillStale
-          ? stillStale.message
-          : fence
-            ? 'Mailbox check failed (consumer_fenced). Bridge skips run-use when already bound (0.2.13+). ' +
-              'If another session shares this OAuth token it can steal the bind — use a separate OAuth token. ' +
-              'Retry await without ack once (bridge already dropped invalid ack on rebind). ' +
-              'Or worker-show --dispatch for inject-path status.'
-            : `Mailbox check failed. ${HEALTH_DIAGNOSTICS_HINT}`,
+        detail:
+          'Mailbox check failed (consumer_fenced). Bridge skips run-use when already bound (0.2.13+). ' +
+          'If another session shares this OAuth token it can steal the bind — use a separate OAuth token. ' +
+          'Retry await without ack once (bridge already dropped invalid ack on rebind). ' +
+          'Or worker-show --dispatch for inject-path status.',
       },
     };
   }
@@ -1662,61 +1429,7 @@ async function awaitDispatch(args = {}) {
   }
   const empty = summary.status === 'empty' || summary.status === 'foreign_only';
   const effectiveTimedOut = res.timedOut === true || (empty && !deliveryId && !filtered);
-
-  // --- NAS-240: liveness from dispatch registry + optional terminal activity ---
-  const ck = currentClientKey();
-  const ownedEntries = dispatchRegistry
-    .list({ clientKey: ck })
-    .filter((d) => d.runId === runId || (d.dispatchId && owned.has(String(d.dispatchId))));
-  // Prefer entries still running / recently updated for this run.
-  let primaryEntry =
-    ownedEntries.find((d) => d.status === 'running') ||
-    ownedEntries.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0] ||
-    null;
-
-  let terminalLastOutputAt = null;
-  let terminalProbe = null;
-  if (empty && primaryEntry?.terminalHandle) {
-    try {
-      const snap = await terminalSnapshot(primaryEntry.terminalHandle);
-      terminalProbe = {
-        ok: snap.ok === true,
-        turns: snap.turns,
-        toolCalls: snap.toolCalls,
-        busyHint: snap.busyHint === true,
-        connected: snap.connected === true,
-        lastOutputAt: snap.lastOutputAt || null,
-      };
-      terminalLastOutputAt = snap.lastOutputAt || null;
-      // Treat busy / turns growth as activity even without lastOutputAt.
-      if (looksWorking(snap) && !terminalLastOutputAt) {
-        terminalLastOutputAt = new Date().toISOString();
-      }
-    } catch {
-      terminalProbe = { ok: false };
-    }
-  }
-
-  const prevEmpty = primaryEntry?.emptyWindowsConsecutive || 0;
-  const emptyWindowsConsecutive = empty ? prevEmpty + 1 : 0;
-  const lastActivityAt = pickLastActivityAt({
-    registryUpdatedAt: primaryEntry?.lastActivityAt || primaryEntry?.updatedAt || null,
-    terminalLastOutputAt,
-    lastMessageAt: empty ? null : new Date().toISOString(),
-  });
-  const livenessInfo = computeLiveness({
-    now: Date.now(),
-    dispatchedAt: primaryEntry?.dispatchedAt || primaryEntry?.createdAt || null,
-    lastActivityAt,
-    emptyWindowsConsecutive,
-    hasDispatch: Boolean(primaryEntry) || owned.size > 0,
-  });
-
-  let next = nextStepForAwait(summary, {
-    timedOut: effectiveTimedOut,
-    deliveryId,
-    livenessInfo: empty ? livenessInfo : null,
-  });
+  let next = nextStepForAwait(summary, { timedOut: effectiveTimedOut, deliveryId });
   if (summary.status === 'foreign_only' || (filtered && summary.status === 'empty')) {
     next = {
       action: 'await',
@@ -1725,7 +1438,6 @@ async function awaitDispatch(args = {}) {
         'Prefer summary.status; foreign_messages is informational.',
       deliveryId: deliveryId || null,
       note: 'Foreign worker_done never yields next.action=release.',
-      liveness: livenessInfo.liveness,
     };
   }
   if (next.action === 'release' && next.dispatchId && owned.size > 0 && !owned.has(String(next.dispatchId))) {
@@ -1739,6 +1451,7 @@ async function awaitDispatch(args = {}) {
   }
 
   // Surface dispatch status + redacted transcript snippets via resources.
+  const ck = currentClientKey();
   for (const m of messages) {
     const did =
       pick(m, 'dispatchId', 'dispatch_id') ||
@@ -1753,8 +1466,6 @@ async function awaitDispatch(args = {}) {
       clientKey: ck,
       lastDeliveryId: deliveryId || null,
       lastMessageType: t || null,
-      lastActivityAt: new Date().toISOString(),
-      emptyWindowsConsecutive: 0,
     });
     let body = '';
     try {
@@ -1776,17 +1487,6 @@ async function awaitDispatch(args = {}) {
       clientKey: ck,
       outcome: summary.worker_done.outcome || null,
       taskId: summary.worker_done.taskId || null,
-      lastActivityAt: new Date().toISOString(),
-      emptyWindowsConsecutive: 0,
-    });
-  } else if (primaryEntry?.dispatchId && empty) {
-    // Advance empty-window counter + activity on the tracked worker.
-    dispatchRegistry.upsert(primaryEntry.dispatchId, {
-      emptyWindowsConsecutive,
-      lastActivityAt: lastActivityAt || primaryEntry.lastActivityAt || null,
-      liveness: livenessInfo.liveness,
-      clientKey: ck,
-      runId,
     });
   }
 
@@ -1799,13 +1499,6 @@ async function awaitDispatch(args = {}) {
     count: typeof res.count === 'number' ? res.count : messages.length,
     summary,
     next,
-    // NAS-240 liveness signal (always present so clients need not special-case).
-    liveness: livenessInfo.liveness,
-    msSinceDispatch: livenessInfo.msSinceDispatch,
-    msSinceActivity: livenessInfo.msSinceActivity,
-    emptyWindowsConsecutive: livenessInfo.emptyWindowsConsecutive,
-    livenessReason: livenessInfo.reason,
-    terminalProbe: terminalProbe || undefined,
     messages,
     foreign_messages: foreignMessages.length ? foreignMessages : undefined,
     foreign_filtered: filtered || undefined,
@@ -1816,17 +1509,10 @@ async function awaitDispatch(args = {}) {
   };
 }
 
-
 async function releaseWorker(args = {}) {
-  try {
-    await ensureRuntimeReady();
-  } catch (e) {
-    return runtimeGuardRejection(e);
-  }
   const dispatchId = String(args.dispatch_id || '').trim();
   const handleHint = String(args.terminal_handle || args.handle || '').trim();
   if (!dispatchId && !handleHint) throw new Error('dispatch_id (or terminal handle) is required');
-
 
   // Inject-path (bridge default): after worker_done the Dispatch is already completed
   // and worker-release often returns dispatch_not_found. That is expected — cleanup is
@@ -2030,16 +1716,9 @@ const TOOLS = [
         types: { type: 'string', description: `Message types; default ${DEFAULT_WAIT_TYPES}` },
         peek: { type: 'boolean', description: 'Peek without consuming' },
         all: { type: 'boolean', description: 'For check: all messages' },
-        verbose: {
-          type: 'boolean',
-          description:
-            'For health: when true, return full statusProbe/actionAnnotations/coordinator dump. ' +
-            'Default false = compact (version, versionOk, statusProbe.ok, defaultRepo, next).',
-        },
       },
       required: [],
     },
-
   },
 ];
 
@@ -2071,11 +1750,8 @@ function pickArgs(args = {}) {
   return a;
 }
 
-async function healthPayload({ verbose = false } = {}) {
-  const probeRun = await runOrca(['status', '--json'], { timeoutMs: 15_000 });
-  const probe = describeRun(probeRun, true);
-  // Keep lazy gate warm so the next dispatch/await skips a probe within TTL.
-  runtimeProbeCache.set(probe);
+async function healthPayload() {
+  const probe = await runOrca(['status', '--json'], { timeoutMs: 15_000 });
   const versionOk = versionGte(VERSION, MIN_BRIDGE_VERSION);
   let sender = null;
   try {
@@ -2083,7 +1759,7 @@ async function healthPayload({ verbose = false } = {}) {
   } catch (e) {
     sender = { ok: false, error: String(e?.message || e) };
   }
-  const full = {
+  return {
     bridge: {
       version: VERSION,
       minVersion: MIN_BRIDGE_VERSION,
@@ -2129,21 +1805,17 @@ async function healthPayload({ verbose = false } = {}) {
       'orca-bridge://dispatches/{id}',
       'orca-bridge://transcripts/{id}',
     ],
-    statusProbe: probe,
+    statusProbe: describeRun(probe, true),
     coordinator: {
       stop_if_version_below: MIN_BRIDGE_VERSION,
       versionOk,
-      flow: 'dispatch → await(≤45s)×N [honor liveness] → worker_done → release(+terminalHandle) → read-only',
+      flow: 'dispatch → await(≤45s)×N → worker_done → release(+terminalHandle) → read-only',
       on_question:
         'orca{action:"cli",args:["orchestration","reply","--id","<id>","--body","<answer>","--json"]} then await+ack',
       prefer_status_over_next: true,
-      liveness_on_empty: true,
-      guide: 'orca{action:"guide"} for waves / brief / devices / stop-conditions',
+      guide: 'orca{action:"guide"} for waves / brief / devices',
       handoff_blocked: true,
       worker_contract_auto_appended: true,
-      health_optional:
-        'health is diagnostics (compact default; verbose:true for full dump). ' +
-        'dispatch/await/release self-check runtime/version — no pre-wave health ritual.',
       sender_auto_injected:
         'Headless orchestration gets --from / check --terminal from bridge (0.2.10+). ' +
         '0.2.11+: per-OAuth-client sender. 0.2.12+: pin-by-handle (shell rewrites titles; no mid-wave recreate). ' +
@@ -2154,8 +1826,7 @@ async function healthPayload({ verbose = false } = {}) {
         ? {
             action: 'dispatch_or_guide',
             detail:
-              'Bridge ready. Start workers with action=dispatch. Call action=guide once if you need waves/brief/devices discipline. ' +
-              'health is optional diagnostics — not required before each wave.',
+              'Bridge ready. Start workers with action=dispatch. Call action=guide once if you need waves/brief/devices discipline.',
           }
         : {
             action: 'fix_sender',
@@ -2170,13 +1841,7 @@ async function healthPayload({ verbose = false } = {}) {
             'Do NOT fall back to worktree create --agent --prompt.',
         },
   };
-
-  if (verbose) {
-    return { ...full, verbose: true, ok: versionOk && full.statusProbe?.ok !== false };
-  }
-  return compactHealthPayload(full);
 }
-
 
 async function callTool(name, args = {}) {
   const a = pickArgs(args);
@@ -2221,8 +1886,7 @@ async function callTool(name, args = {}) {
 }
 
 async function callToolUnlocked(op, a) {
-  if (op === 'health') return healthPayload({ verbose: a.verbose === true });
-
+  if (op === 'health') return healthPayload();
 
   if (op === 'guide') return coordinatorGuide();
 
@@ -2261,11 +1925,9 @@ async function callToolUnlocked(op, a) {
   if (op === 'check') {
     const waitMs = Math.min(Math.max(a.waitMs ?? CHECK_WAIT_DEFAULT_MS, 0), CHECK_WAIT_MAX_MS);
     const types = a.types != null ? String(a.types) : DEFAULT_WAIT_TYPES;
-    let ack = a.ack != null && String(a.ack).trim() !== '' ? String(a.ack).trim() : null;
-    let ackDropped = null;
     let argv = ['orchestration', 'check'];
     if (a.runId) argv.push('--run', String(a.runId));
-    if (ack) argv.push('--ack', ack);
+    if (a.ack) argv.push('--ack', String(a.ack));
     if (a.peek) argv.push('--peek');
     if (a.all) argv.push('--all');
     if (types) argv.push('--types', types);
@@ -2298,40 +1960,8 @@ async function callToolUnlocked(op, a) {
         },
       };
     }
-    let run = await runOrca(argv, { timeoutMs: waitMs + 30_000 });
-    let described = describeRun(run, true);
-    let staleInfo = ack ? staleFromDescribed(described, ack) : null;
-    if (staleInfo && ack) {
-      // Drop bad ack (often messages[].id) and retry once without it.
-      ackDropped = {
-        deliveryId: ack,
-        reason: staleInfo.hint || 'stale_delivery',
-        detail: staleInfo.message,
-      };
-      const retryArgv = argv.filter((t, i, arr) => {
-        if (t === '--ack') return false;
-        if (i > 0 && arr[i - 1] === '--ack') return false;
-        return true;
-      });
-      run = await runOrca(retryArgv, { timeoutMs: waitMs + 30_000 });
-      described = describeRun(run, true);
-      staleInfo = staleFromDescribed(described, ackDropped.deliveryId);
-      // Successful retry clears stale; if still stale without ack, keep envelope.
-      if (described.ok !== false && !described.envelope?.error) staleInfo = null;
-    }
-    return {
-      window_ms: waitMs,
-      client_key: currentClientKey(),
-      ...described,
-      ack_dropped: ackDropped || undefined,
-      error_detail: staleInfo || undefined,
-      next: staleInfo
-        ? {
-            action: 'retry_check_without_ack',
-            detail: staleInfo.message,
-          }
-        : undefined,
-    };
+    const run = await runOrca(argv, { timeoutMs: waitMs + 30_000 });
+    return { window_ms: waitMs, client_key: currentClientKey(), ...describeRun(run, true) };
   }
 
   if (op === 'cli') {
@@ -2357,24 +1987,7 @@ async function callToolUnlocked(op, a) {
       }
     }
     const run = await runOrca(argv, { timeoutMs: a.timeoutMs, cwd: a.cwd });
-    const described = describeRun(run, a.args.includes('--json'));
-    // NAS-239 dual-route: non-question reply → also send to dispatch:<id>.
-    if (
-      a.args[0] === 'orchestration' &&
-      String(a.args[1] || '').toLowerCase() === 'reply' &&
-      described.ok !== false
-    ) {
-      try {
-        const dual = await dualRouteNonQuestionReply(a.args, described);
-        if (dual) described.escalation_reply_route = dual;
-      } catch (e) {
-        described.escalation_reply_route = {
-          dual_routed: false,
-          error: String(e?.message || e),
-        };
-      }
-    }
-    return described;
+    return describeRun(run, a.args.includes('--json'));
   }
 
   throw new Error(`unknown tool: ${op}`);
@@ -2414,11 +2027,10 @@ async function handleRpc(msg, { sessionId } = {}) {
           serverInfo: { name: 'orca-bridge', version: VERSION },
           instructions:
             'orca-bridge v' + VERSION + ' (min ' + MIN_BRIDGE_VERSION + '). Single tool `orca` + action. ' +
+            'Session start: action=health (require versionOk + statusProbe.ok). ' +
             'Workers: dispatch → await(waitMs:45000)×N → worker_done → release(dispatchId,terminalHandle). ' +
-            'Runtime/version self-checked lazily on dispatch/await/release (errors include code+recovery). ' +
-            'Empty await carries liveness active|idle|stalled|unknown — re-call while active/idle; stalled → diagnose (peek/ping/release+report). ' +
-            'question → cli orchestration reply then await+ack. Prefer summary.status over next.action; honor liveness on empty. ' +
-            'health = optional compact diagnostics (verbose:true for full dump). guide = waves/brief/devices/stop-conditions. ' +
+            'Empty await = re-call. question → cli orchestration reply then await+ack. ' +
+            'Prefer summary.status over next.action. guide = waves/brief/devices. ' +
             'worker_done contract auto-appended on dispatch. ' +
             'Per-OAuth-client sender pin-by-handle (0.2.12+) — no mid-wave recreate; multi-coord safe. ' +
             'worktree create --agent --prompt rejected on cli.',
@@ -2426,7 +2038,6 @@ async function handleRpc(msg, { sessionId } = {}) {
         sessionId: sid,
         isInitialize: true,
       };
-
     }
     if (method === 'notifications/initialized' || method?.startsWith('notifications/')) {
       return { response: null, sessionId };
@@ -2978,6 +2589,20 @@ const server = http.createServer(async (req, res) => {
 // --- Transport selection: --stdio (local hosts) or Streamable HTTP (default) ---
 
 /**
+ * Boot check: the bridge must own the state it persists.
+ *
+ * A privileged install/upgrade/migration can replace ~/.orca-bridge-tokens.json
+ * with a root-owned inode. Nothing then fails loudly — the bridge just starts
+ * with an empty token set and every client silently re-authorizes, so this is
+ * worth one noisy line at boot. See docs/design.md#state-file-ownership.
+ */
+function logStateOwnershipWarnings() {
+  const warnings = stateOwnershipWarnings([TOKEN_STORE, SENDER_PIN_STORE, AUDIT_DIR]);
+  for (const w of warnings) log(`WARN: ${w}`);
+  return warnings.length;
+}
+
+/**
  * stdio transport (MCP 2025-11-25): newline-delimited JSON-RPC on stdin/stdout.
  * Auth is env-only (ORCA_BRIDGE_TOKEN already required at boot). No OAuth browser flow.
  * Shared handleRpc / callTool — identical tool surface to HTTP mode.
@@ -3055,6 +2680,7 @@ function startStdioServer() {
 
   log(`orca-bridge v${VERSION} stdio mode (protocol ${PROTOCOL_TARGET})`);
   log(`orca binary: ${orcaBinary()} | auth=ORCA_BRIDGE_TOKEN (env)`);
+  logStateOwnershipWarnings();
 }
 
 function startHttpServer() {
@@ -3066,6 +2692,7 @@ function startHttpServer() {
     log(`toolsets: [${TOOLSET_GATE.enabledList.join(',')}] source=${TOOLSET_GATE.source}` +
       (TOOLSET_GATE.readOnly ? ' read-only' : ''));
     log('expose via: tailscale funnel --bg ' + PORT);
+    logStateOwnershipWarnings();
   });
 }
 
