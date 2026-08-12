@@ -19,7 +19,7 @@ Optional diagnostics (compact by default: ok, bridge.version, versionOk, statusP
 | empty / timeout (active|idle) | Call `await` again — **normal** early; watch `liveness` + `emptyWindowsConsecutive` |
 | empty + liveness=stalled | `check --peek` → optional ping → `release` + report owner (**stop-condition**) |
 | question | `cli` → `orchestration reply --id … --body … --json`, then `await` + `ack` |
-| escalation | Read body; answer / new task / fail; always ack |
+| escalation | `cli` → `orchestration reply` (bridge dual-routes onto `dispatch:<id>`), then `await` + `ack`; prefer `orchestration ask` for back-and-forth |
 | worker_done | `release` with `dispatchId` + worker `terminalHandle`; outcome = body + filesModified |
 
 next.action is a **hint**. Prefer summary.status when they disagree. On empty windows also honor liveness (stalled → diagnose, not blind re-await).

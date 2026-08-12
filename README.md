@@ -365,7 +365,7 @@ Runtime/version gates run **lazily** inside `dispatch` / `await` / `release` (se
 | empty / timeout (active\|idle) | Re-call `await` — normal early; watch `liveness` |
 | empty + liveness=stalled | Stop-condition: peek → ping → release + report |
 | question | Reply via `cli` → `orchestration reply`, then await + ack |
-| escalation | Read body; answer / re-task / fail; always ack |
+| escalation | Reply via `cli` → `orchestration reply` (dual-routes onto `dispatch:<id>`), then await + ack; prefer `ask` for back-and-forth |
 | worker_done | `release` with `dispatchId` + worker `terminalHandle` |
 
 Full discipline: tool description, `action=guide`, and [`COORDINATOR.md`](./COORDINATOR.md).
