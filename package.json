@@ -47,8 +47,10 @@
     "lib/coordinator-doctrine.mjs",
     "lib/orch-isolation.mjs",
     "lib/security-core.mjs",
+    "lib/runtime-guard.mjs",
     "lib/toolsets.mjs",
     "scripts/",
+
     "docs/",
     "COORDINATOR.md",
     "deploy/",

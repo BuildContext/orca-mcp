@@ -9,17 +9,26 @@ Bridge ≥ 0.2.9 returns the same structure via `action=guide`.
 ## Supervised flow
 
 ```text
-health → dispatch → await(≤45s)×N → worker_done → release(dispatchId, terminalHandle) → read-only
+dispatch → await(≤45s)×N [honor liveness] → worker_done → release(dispatchId, terminalHandle) → read-only
 ```
+
+Optional diagnostics (compact by default: ok, bridge.version, versionOk, statusProbe.ok, sender, toolsets, next). Pass verbose:true for full statusProbe/actionAnnotations. Not required before each wave — dispatch/await/release self-diagnose runtime/version failures.
 
 | await `summary.status` | Action |
 |------------------------|--------|
-| empty / timeout | Call `await` again — **normal**, not a failure |
+| empty / timeout (active|idle) | Call `await` again — **normal** early; watch `liveness` + `emptyWindowsConsecutive` |
+| empty + liveness=stalled | `check --peek` → optional ping → `release` + report owner (**stop-condition**) |
 | question | `cli` → `orchestration reply --id … --body … --json`, then `await` + `ack` |
 | escalation | Read body; answer / new task / fail; always ack |
 | worker_done | `release` with `dispatchId` + worker `terminalHandle`; outcome = body + filesModified |
 
-next.action is a **hint**. Prefer summary.status when they disagree.
+next.action is a **hint**. Prefer summary.status when they disagree. On empty windows also honor liveness (stalled → diagnose, not blind re-await).
+
+### Liveness stop-condition
+
+- Escalate when `liveness=stalled` (default: ≥ **8** empty ~45s windows, or ~**8 min** without activity).
+- Hard ceiling ~**15 min** without progress → release with diagnostics and report to owner.
+- Protocol: `check`/`cli` peek → optional worker ping → release + owner report. Do **not** infinite-loop `await` on empty.
 
 ## Waves
 
@@ -48,7 +57,9 @@ The bridge **appends** a `worker_done` contract itself. Still spell out in the b
 | `terminal wait --for tui-idle/exit as completion` | idle ≠ done; omp rarely exits |
 | `single await waitMs > 45000 when client wrapper ~60s` | prefer 45000 and re-call; hard max 240000 |
 | `success from terminal preview text` | only `worker_done` + outcome |
-| `release on timeout / empty window` | only after `worker_done` |
+| `release on timeout / empty while active|idle` | only after `worker_done` (or stalled diagnose) |
+| `health before every wave as a ritual` | use on demand; runtime errors self-diagnose |
+| `infinite await on empty when liveness=stalled` | diagnose / ping / release+report |
 
 `terminal read --limit N` is for liveness/debug, not a substitute for `await`.
 
@@ -62,7 +73,7 @@ The bridge **appends** a `worker_done` contract itself. Still spell out in the b
 Not allowed:
 
 - worktree create --agent --prompt as main work path (enforced reject)
-- prefer action=await over raw orchestration check except debug
+- prefer action=await over raw orchestration check except debug / stalled diagnose
 
 ## Devices
 
@@ -80,6 +91,6 @@ coordinator sender from `health`.
 ## Post-done read-only
 
 After `worker_done` the coordinator may inspect: git status/diff/log, grep, files.
-Patches / commits / package installs / fixes → **new dispatch** (flow step 5).
+Patches / commits / package installs / fixes → **new dispatch** (flow step 4).
 Close any raw terminals you opened immediately after reading.
 <!-- END GENERATED: coordinator-discipline -->
