@@ -108,6 +108,7 @@ import {
   STATE_FILE_MODE,
   stateOwnershipWarnings,
   writeFilePreservingOwner,
+  resolveTerminalHandleOwnership,
 } from './lib/state-ownership.mjs';
 
 const execFile = promisify(execFileCb);
@@ -158,6 +159,8 @@ const TOOLSET_GATE = createToolsetGate({ env: process.env, argv: process.argv })
 // Opt-in cli allowlist. Default permissive (hardening off).
 // ORCA_BRIDGE_CLI_HARDENING=1 enforces deny-by-default allowlist.
 // Admin unlock follows the effective toolset admin bit (toolset collapse).
+// ownershipCheck closes over live senderCaches / clientOwnership / dispatchRegistry
+// (resolved at call time). client_key comes from requestContext via currentClientKey().
 const CLI_POLICY = createCliPolicy({
   ...resolveCliPolicyConfig(process.env),
   admin: TOOLSET_GATE.admin,
@@ -169,6 +172,16 @@ const CLI_POLICY = createCliPolicy({
       ...warning,
     }));
   },
+  ownershipCheck: (ctx) => resolveTerminalHandleOwnership(
+    ctx.handle,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+      senderCaches,
+      coordinatorHandles,
+    },
+  ),
 });
 const SENDER_CACHE_TTL_MS = 15_000;
 // ORCH_FROM_CMDS, CHECK_WAIT_*, DEFAULT_WAIT_TYPES imported from security-core.mjs
