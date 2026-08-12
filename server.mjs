@@ -87,8 +87,10 @@ import {
   computeLiveness,
   nextStepForLiveness,
   pickLastActivityAt,
+  isDeadRuntimeSignal,
+  deadRuntimeFailure,
+  HEALTH_DIAGNOSTICS_HINT,
 } from './lib/runtime-guard.mjs';
-
 
 import {
   ORCA_TOOL_ANNOTATIONS,
@@ -536,10 +538,16 @@ function runtimeGuardRejection(err) {
       code: 'runtime_unavailable',
       message: String(err?.message || err),
       reason: String(err?.message || err),
-      recovery: 'Retry once; if it persists, run action=health and ask the owner to check the orca daemon.',
+      recovery: `Retry once; if it persists, ${HEALTH_DIAGNOSTICS_HINT}`,
     },
     next: { action: 'diagnose', detail: 'Unexpected runtime error before supervised action.' },
   };
+}
+
+/** Prefer structured runtime_unavailable when a step shows a dead CLI/runtime. */
+function maybeDeadRuntime(described, ctx = {}) {
+  if (!isDeadRuntimeSignal(described)) return null;
+  return deadRuntimeFailure(described, ctx);
 }
 
 
@@ -1170,12 +1178,17 @@ async function dispatchWorker(args = {}) {
     );
     steps.push({ step: 'run-create', ...created });
     if (!envOk(created)) {
+      const dead = maybeDeadRuntime(created, { stage: 'run-create' });
+      if (dead) return { ...dead, steps };
       return {
         ok: false,
         stage: 'run-create',
         error: 'run-create failed',
         steps,
-        next: { action: 'fix', detail: 'Check Orca runtime / orchestration experimental.' },
+        next: {
+          action: 'fix',
+          detail: `Check Orca runtime / orchestration experimental. ${HEALTH_DIAGNOSTICS_HINT}`,
+        },
       };
     }
     runId = pick(created.envelope?.result?.run, 'id') || pick(created.envelope?.result, 'runId', 'id');
@@ -1572,6 +1585,21 @@ async function awaitDispatch(args = {}) {
 
   if ((!described.envelope && described.ok === false) || fence || (env.error && isStaleDeliveryError(env.error?.code, env.error?.message))) {
     const stillStale = staleFromDescribed(described, ackDropped?.deliveryId || args.ack);
+    if (!fence && !stillStale) {
+      const dead = maybeDeadRuntime(described, { stage: 'await-check', runId });
+      if (dead) {
+        return {
+          ...dead,
+          window_ms: waitMs,
+          client_key: currentClientKey(),
+          sender_handle: sender.handle,
+          run_use: useRes?.envelope || useRes || null,
+          run_use_skipped: runUseSkipped || undefined,
+          ack_dropped: ackDropped || undefined,
+          raw: described,
+        };
+      }
+    }
     return {
       ok: false,
       run_id: runId,
@@ -1581,6 +1609,11 @@ async function awaitDispatch(args = {}) {
         : stillStale
           ? 'stale_delivery'
           : 'check failed',
+      errorCode: fence
+        ? 'consumer_fenced'
+        : stillStale
+          ? 'stale_delivery'
+          : 'check_failed',
       error_detail: stillStale || undefined,
       client_key: currentClientKey(),
       sender_handle: sender.handle,
@@ -1589,13 +1622,15 @@ async function awaitDispatch(args = {}) {
       ack_dropped: ackDropped || undefined,
       raw: described,
       next: {
-        action: stillStale ? 'retry_await_without_ack_once' : 'retry_await_without_ack_once',
+        action: 'retry_await_without_ack_once',
         detail: stillStale
           ? stillStale.message
-          : 'Mailbox check failed (consumer_fenced). Bridge skips run-use when already bound (0.2.13+). ' +
-            'If another session shares this OAuth token it can steal the bind — use a separate OAuth token. ' +
-            'Retry await without ack once (bridge already dropped invalid ack on rebind). ' +
-            'Or worker-show --dispatch for inject-path status.',
+          : fence
+            ? 'Mailbox check failed (consumer_fenced). Bridge skips run-use when already bound (0.2.13+). ' +
+              'If another session shares this OAuth token it can steal the bind — use a separate OAuth token. ' +
+              'Retry await without ack once (bridge already dropped invalid ack on rebind). ' +
+              'Or worker-show --dispatch for inject-path status.'
+            : `Mailbox check failed. ${HEALTH_DIAGNOSTICS_HINT}`,
       },
     };
   }
@@ -1999,7 +2034,7 @@ const TOOLS = [
           type: 'boolean',
           description:
             'For health: when true, return full statusProbe/actionAnnotations/coordinator dump. ' +
-            'Default false = compact (ok, bridge.version, versionOk, statusProbe.ok, sender, toolsets, next).',
+            'Default false = compact (version, versionOk, statusProbe.ok, defaultRepo, next).',
         },
       },
       required: [],

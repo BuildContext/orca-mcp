@@ -12,7 +12,7 @@ Bridge ≥ 0.2.9 returns the same structure via `action=guide`.
 dispatch → await(≤45s)×N [honor liveness] → worker_done → release(dispatchId, terminalHandle) → read-only
 ```
 
-Optional diagnostics (compact by default: ok, bridge.version, versionOk, statusProbe.ok, sender, toolsets, next). Pass verbose:true for full statusProbe/actionAnnotations. Not required before each wave — dispatch/await/release self-diagnose runtime/version failures.
+Optional diagnostics (compact default: version, versionOk, statusProbe.ok, defaultRepo, next). Pass verbose:true for full statusProbe/actionAnnotations. Not required before each wave — dispatch/await/release self-diagnose runtime/version failures.
 
 | await `summary.status` | Action |
 |------------------------|--------|
