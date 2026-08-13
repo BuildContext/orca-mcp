@@ -768,11 +768,22 @@ function describeRun(run, wantJson) {
 function argvWantsJson(args) {
   if (!Array.isArray(args)) return false;
   for (const a of args) {
-    const s = String(a);
-    if (s === '--json') return true;
-    if (s.startsWith('--json=')) return true;
+    const tok = String(a);
+    if (tok === '--json') return true;
+    if (tok.startsWith('--json=')) return true;
   }
   return false;
+}
+
+/**
+ * NAS-252 output parity: human stdout cannot be structurally walked.
+ * Inject --json on spawn for commands whose responses may carry foreign content
+ * so applyOwnershipListRedaction always sees an envelope/JSON body.
+ */
+function ensureWalkableCliArgv(args) {
+  if (!Array.isArray(args)) return args;
+  if (argvWantsJson(args)) return args;
+  return [...args, '--json'];
 }
 
 
@@ -1278,7 +1289,8 @@ async function withSender(argv) {
   if (argv[0] !== 'orchestration') return argv;
   const sub = argv[1];
   const needsFrom = ORCH_FROM_CMDS.has(sub);
-  const needsTerminal = sub === 'check';
+  // NAS-252 r7 P0: inbox must hit the same pin path as check (spawn path, not just helper).
+  const needsTerminal = sub === 'check' || sub === 'inbox';
   if (!needsFrom && !needsTerminal) return argv;
 
   const sender = await resolveSenderTerminal();
@@ -1292,7 +1304,7 @@ async function runJson(argv, { timeoutMs, cwd, injectSender = true } = {}) {
       finalArgv = await withSender(argv);
     } catch (e) {
       const sub = argv[1];
-      if (ORCH_FROM_CMDS.has(sub) || sub === 'check') {
+      if (ORCH_FROM_CMDS.has(sub) || sub === 'check' || sub === 'inbox') {
         return {
           ok: false,
           envelope: {
@@ -2539,7 +2551,7 @@ async function callToolUnlocked(op, a) {
       argv = await withSender(a.args);
     } catch (e) {
       const sub = a.args[0] === 'orchestration' ? a.args[1] : null;
-      if (ORCH_FROM_CMDS.has(sub) || sub === 'check') {
+      if (ORCH_FROM_CMDS.has(sub) || sub === 'check' || sub === 'inbox') {
         return {
           ok: false,
           error: 'no_sender_terminal',
@@ -2548,8 +2560,10 @@ async function callToolUnlocked(op, a) {
         };
       }
     }
+    // Output parity: always spawn walkable JSON so redaction is never a no-op.
+    argv = ensureWalkableCliArgv(argv);
     const run = await runOrca(argv, { timeoutMs: a.timeoutMs, cwd: a.cwd });
-    const described = describeRun(run, argvWantsJson(a.args));
+    const described = describeRun(run, true);
     // NAS-248: redact foreign scrollback by RESPONSE SHAPE, not argv spelling.
     // Internal runJson (resolveSenderTerminal) is unredacted on purpose.
     applyCliOwnershipRedaction(described, a.args);
