@@ -214,6 +214,9 @@ const coordinatorHandles = new Set();
  * Per-client ownership for mailbox filtering + run binding.
  * boundRunId/boundSender: last successful run-use for this client pin.
  * Skipping redundant run-use preserves consumer_generation so ack works (0.2.13).
+ *
+ * NAS-248 P0 #4: dispatch/terminal ownership is established only at dispatch
+ * (or hydrate from durable store). await/check must never claim a dispatchId.
  * @type {Map<string, { runs: Set<string>, dispatches: Set<string>, workerHandles: Set<string>, boundRunId: string|null, boundSender: string|null }>}
  */
 const clientOwnership = new Map();
@@ -237,8 +240,13 @@ function ownershipFor(clientKey) {
   return reg;
 }
 
-function registerOwnedDispatch({ runId, dispatchId, terminalHandle } = {}) {
-  const reg = ownershipFor(currentClientKey());
+/**
+ * Record in-memory ownership bits for a client.
+ * When `clientKey` is omitted, uses the active request client.
+ * runId-only calls (await/check rebind) do NOT claim dispatch ownership.
+ */
+function registerOwnedDispatch({ runId, dispatchId, terminalHandle, clientKey } = {}) {
+  const reg = ownershipFor(clientKey || currentClientKey());
   if (runId) reg.runs.add(String(runId));
   if (dispatchId) reg.dispatches.add(String(dispatchId));
   if (terminalHandle) reg.workerHandles.add(String(terminalHandle));
@@ -324,6 +332,143 @@ const AUDIT_DIR = (process.env.ORCA_BRIDGE_AUDIT_DIR || '').trim()
   || path.join(os.homedir(), '.orca-bridge');
 const auditLog = createAuditLog({ dir: AUDIT_DIR });
 const dispatchRegistry = createDispatchRegistry();
+
+/**
+ * Durable dispatch ownership bindings (NAS-248 P0 #4).
+ * Survives bridge process restart so coordinators can still release workers they
+ * legitimately dispatched. Never written from await/check claim paths — only from
+ * dispatch-time bindOwner / hydrate. Not keyed on runtimeId.
+ */
+const OWNERSHIP_STORE = path.join(AUDIT_DIR, 'dispatch-ownership.json');
+
+function persistOwnershipBindings() {
+  try {
+    if (!fs.existsSync(AUDIT_DIR)) {
+      fs.mkdirSync(AUDIT_DIR, { recursive: true, mode: 0o700 });
+    }
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      bindings: dispatchRegistry.listOwnershipBindings(),
+    };
+    const res = writeFilePreservingOwner(
+      OWNERSHIP_STORE,
+      JSON.stringify(payload, null, 2),
+      { mode: STATE_FILE_MODE },
+    );
+    if (res.chownError) {
+      console.error(
+        `WARN: ownership store owner not restored (${res.chownError}); ` +
+          `chown it back to the service user or release-after-restart will fail closed`,
+      );
+    }
+  } catch (e) {
+    console.error('WARN: cannot persist dispatch ownership:', e.message);
+  }
+}
+
+/**
+ * Hydrate registry + clientOwnership from durable bindings after process restart.
+ * bindOwner refuses reassignment — first writer wins.
+ */
+function loadPersistedOwnership() {
+  try {
+    if (!fs.existsSync(OWNERSHIP_STORE)) return 0;
+    const raw = JSON.parse(fs.readFileSync(OWNERSHIP_STORE, 'utf8'));
+    const bindings = Array.isArray(raw?.bindings)
+      ? raw.bindings
+      : Array.isArray(raw)
+        ? raw
+        : [];
+    let n = 0;
+    for (const b of bindings) {
+      if (!b || typeof b !== 'object') continue;
+      const dispatchId = b.dispatchId != null ? String(b.dispatchId).trim() : '';
+      const clientKey = b.clientKey != null ? String(b.clientKey).trim() : '';
+      if (!dispatchId || !clientKey) continue;
+      const bound = dispatchRegistry.bindOwner(dispatchId, {
+        status: b.status || 'running',
+        runId: b.runId || null,
+        taskId: b.taskId || null,
+        terminalHandle: b.terminalHandle || null,
+        clientKey,
+        agent: b.agent || null,
+        worktree: b.worktree || null,
+        name: b.name || null,
+        dispatchedAt: b.dispatchedAt || null,
+        lastActivityAt: b.lastActivityAt || b.dispatchedAt || null,
+        source: 'persisted',
+      });
+      if (!bound.ok) continue;
+      registerOwnedDispatch({
+        runId: b.runId || null,
+        dispatchId,
+        terminalHandle: b.terminalHandle || null,
+        clientKey,
+      });
+      n += 1;
+    }
+    return n;
+  } catch (e) {
+    console.error('WARN: cannot load dispatch ownership:', e.message);
+    return 0;
+  }
+}
+
+/**
+ * Authoritative dispatch-time ownership bind + durable persist.
+ * The only path that may create a clientKey binding for a dispatch id.
+ */
+function bindOwnedDispatch({
+  runId,
+  dispatchId,
+  terminalHandle,
+  taskId,
+  status = 'running',
+  agent = null,
+  worktree = null,
+  name = null,
+  clientKey,
+  extra = {},
+} = {}) {
+  const ck = clientKey || currentClientKey();
+  const id = dispatchId != null ? String(dispatchId).trim() : '';
+  if (!id) {
+    // No dispatch id yet — track run/handle only (not a claimable ownership row).
+    registerOwnedDispatch({ runId, terminalHandle, clientKey: ck });
+    return { ok: true, claimed: false };
+  }
+  const bound = dispatchRegistry.bindOwner(id, {
+    status,
+    runId: runId || null,
+    taskId: taskId || null,
+    terminalHandle: terminalHandle || null,
+    clientKey: ck,
+    agent,
+    worktree,
+    name,
+    dispatchedAt: extra.dispatchedAt || new Date().toISOString(),
+    lastActivityAt: extra.lastActivityAt || new Date().toISOString(),
+    emptyWindowsConsecutive: 0,
+    ...extra,
+  });
+  if (!bound.ok) {
+    return bound;
+  }
+  registerOwnedDispatch({
+    runId,
+    dispatchId: id,
+    terminalHandle,
+    clientKey: ck,
+  });
+  persistOwnershipBindings();
+  return bound;
+}
+
+const _ownershipHydrated = loadPersistedOwnership();
+if (_ownershipHydrated > 0) {
+  console.error(`orca-bridge: restored ${_ownershipHydrated} durable dispatch ownership binding(s)`);
+}
 
 /** Marker so we do not double-append the worker_done contract to specs. */
 const WORKER_CONTRACT_MARKER = '<!-- orca-bridge-worker-contract -->';
@@ -1506,27 +1651,18 @@ async function dispatchWorker(args = {}) {
     }
   }
 
-  // Track ownership so await never suggests release on another coordinator's worker.
-  registerOwnedDispatch({
+  // Authoritative ownership bind at dispatch-time only (NAS-248 P0 #4).
+  // await/check must never create or reassign clientKey bindings.
+  bindOwnedDispatch({
     runId,
     dispatchId: dispatchId || null,
     terminalHandle: handle,
+    taskId,
+    status: 'running',
+    agent,
+    worktree: worktreePath || null,
+    name: name || null,
   });
-  if (dispatchId) {
-    dispatchRegistry.upsert(dispatchId, {
-      status: 'running',
-      runId,
-      taskId,
-      terminalHandle: handle,
-      clientKey: currentClientKey(),
-      agent,
-      worktree: worktreePath || null,
-      name: name || null,
-      dispatchedAt: new Date().toISOString(),
-      lastActivityAt: new Date().toISOString(),
-      emptyWindowsConsecutive: 0,
-    });
-  }
 
 
   return {
@@ -1571,8 +1707,8 @@ async function awaitDispatch(args = {}) {
   const types = String(args.types || DEFAULT_WAIT_TYPES).trim() || DEFAULT_WAIT_TYPES;
 
   // Pin first — check --terminal and run-use --from must be the same durable handle.
+  // NAS-248 P0 #4: do NOT registerOwnedDispatch on await — reads never claim ownership.
   const sender = await resolveSenderTerminal();
-  registerOwnedDispatch({ runId });
 
   /**
    * Mechanism B (0.2.13):
@@ -1826,6 +1962,8 @@ async function awaitDispatch(args = {}) {
   }
 
   // Surface dispatch status + redacted transcript snippets via resources.
+  // NAS-248 P0 #4: never bind/claim clientKey here. Only update rows already
+  // owned by this client (partitionMailbox is fail-closed; this is defense in depth).
   for (const m of messages) {
     const did =
       pick(m, 'dispatchId', 'dispatch_id') ||
@@ -1833,11 +1971,15 @@ async function awaitDispatch(args = {}) {
       summary.worker_done?.dispatchId ||
       null;
     if (!did) continue;
+    const didStr = String(did);
+    if (!owned.has(didStr)) continue;
+    const existing = dispatchRegistry.get(didStr);
+    // No claim-on-read for unbound or foreign ids.
+    if (!existing?.clientKey || String(existing.clientKey) !== ck) continue;
     const t = msgType(m);
-    dispatchRegistry.upsert(did, {
+    dispatchRegistry.upsert(didStr, {
       status: t === 'worker_done' ? 'worker_done' : (t || 'message'),
       runId,
-      clientKey: ck,
       lastDeliveryId: deliveryId || null,
       lastMessageType: t || null,
       lastActivityAt: new Date().toISOString(),
@@ -1850,31 +1992,38 @@ async function awaitDispatch(args = {}) {
     } catch {
       body = String(m?.body || '');
     }
-    dispatchRegistry.appendTranscript(did, {
+    dispatchRegistry.appendTranscript(didStr, {
       type: t || 'message',
       body: String(redactValue(body, 'body')).slice(0, 4000),
       deliveryId: deliveryId || pick(m, 'deliveryId', 'delivery_id') || null,
     });
   }
   if (summary.worker_done?.dispatchId) {
-    dispatchRegistry.upsert(summary.worker_done.dispatchId, {
-      status: 'worker_done',
-      runId,
-      clientKey: ck,
-      outcome: summary.worker_done.outcome || null,
-      taskId: summary.worker_done.taskId || null,
-      lastActivityAt: new Date().toISOString(),
-      emptyWindowsConsecutive: 0,
-    });
+    const didStr = String(summary.worker_done.dispatchId);
+    if (owned.has(didStr)) {
+      const existing = dispatchRegistry.get(didStr);
+      if (existing?.clientKey && String(existing.clientKey) === ck) {
+        dispatchRegistry.upsert(didStr, {
+          status: 'worker_done',
+          runId,
+          outcome: summary.worker_done.outcome || null,
+          taskId: summary.worker_done.taskId || null,
+          lastActivityAt: new Date().toISOString(),
+          emptyWindowsConsecutive: 0,
+        });
+      }
+    }
   } else if (primaryEntry?.dispatchId && empty) {
     // Advance empty-window counter + activity on the tracked worker.
-    dispatchRegistry.upsert(primaryEntry.dispatchId, {
-      emptyWindowsConsecutive,
-      lastActivityAt: lastActivityAt || primaryEntry.lastActivityAt || null,
-      liveness: livenessInfo.liveness,
-      clientKey: ck,
-      runId,
-    });
+    const didStr = String(primaryEntry.dispatchId);
+    if (owned.has(didStr) && primaryEntry.clientKey && String(primaryEntry.clientKey) === ck) {
+      dispatchRegistry.upsert(didStr, {
+        emptyWindowsConsecutive,
+        lastActivityAt: lastActivityAt || primaryEntry.lastActivityAt || null,
+        liveness: livenessInfo.liveness,
+        runId,
+      });
+    }
   }
 
   return {
@@ -2250,9 +2399,9 @@ async function callToolUnlocked(op, a) {
     if (waitMs > 0) argv.push('--wait', '--timeout-ms', String(waitMs));
     argv.push('--json');
     // Rebind only when not already bound (same rule as await — preserve ack generation).
+    // NAS-248 P0 #4: check must not registerOwnedDispatch / claim ownership.
     if (a.runId) {
       const rid = String(a.runId);
-      registerOwnedDispatch({ runId: rid });
       const sender = await resolveSenderTerminal();
       if (!isRunBound(rid, sender.handle)) {
         const useRes = await runJson(
@@ -2967,7 +3116,7 @@ const server = http.createServer(async (req, res) => {
  * worth one noisy line at boot. See docs/design.md#state-file-ownership.
  */
 function logStateOwnershipWarnings() {
-  const warnings = stateOwnershipWarnings([TOKEN_STORE, SENDER_PIN_STORE, AUDIT_DIR]);
+  const warnings = stateOwnershipWarnings([TOKEN_STORE, SENDER_PIN_STORE, OWNERSHIP_STORE, AUDIT_DIR]);
   for (const w of warnings) log(`WARN: ${w}`);
   return warnings.length;
 }

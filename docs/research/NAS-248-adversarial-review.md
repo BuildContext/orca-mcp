@@ -726,3 +726,76 @@ See Priority 3 table. N1 is the live read P0. N3 is the argv-proof destructive P
 5. Do not merge under "the two P0s are fixed, 346 green." They are fixed. The invariant is not.
 
 Independent suite: **346 pass / 0 fail / 0 skipped**.
+
+## Fix pass (P0 #4 claim-path / N2) — 2026-08-13
+
+**Implementer:** dispatched fix worker on `BuildContext/nas-248-ownership-invariant` (HEAD was second-review `00ebeb2`).  
+**Scope:** only N2 / P0 #4 (empty owned-set + await upsert forges `clientKey`).  
+**Out of scope (untouched, still live as of this commit):** N1 / P0 #3 (`terminal show --json` preview via shape redaction miss); N3 / P0 #5 (`terminal stop --worktree` soft-exec); hardening-OFF outside named prefixes; F3 `dispatch-show` metadata; F5 MCP orphan-read.
+
+### Confirmation
+
+P0 #4 was real on `367ebb6`/`00ebeb2`:
+
+1. `partitionMailbox` fail-opened when `owned.size === 0` (`own = list`).
+2. `awaitDispatch` then `dispatchRegistry.upsert(did, { clientKey: caller, ... })` overwrote bob→alice.
+3. `requireOwnedDispatch` honestly reported owned; `action=release` would pass preflight.
+
+### Ownership-store write sites (audit)
+
+| Site | Provenance after this fix |
+|------|---------------------------|
+| `bindOwnedDispatch` → `dispatchRegistry.bindOwner` + `registerOwnedDispatch` + `persistOwnershipBindings` | **Legitimate.** Only from `dispatchWorker` after a successful dispatch. Authoritative bind. |
+| `loadPersistedOwnership` → `bindOwner` + `registerOwnedDispatch` | **Legitimate hydrate.** Boot restore from `~/.orca-bridge/dispatch-ownership.json`. Same owner only (`bindOwner` refuses mismatch). Not caller-supplied identity. |
+| `dispatchRegistry.upsert` (await status/liveness/transcript; release status) | **Non-claiming.** Strips `clientKey`; preserves prior owner; refuses terminalHandle overwrite when set. Await only updates rows already owned by caller. |
+| `registerOwnedDispatch` from await/check | **Removed.** Reads must not mutate ownership sets. |
+| `markRunBound` on await/check after successful `run-use` | **Not a dispatch ownership claim.** Tracks pin↔run bind for ack-safe skip of re-`run-use` only (`boundRunId`/`boundSender`). Not keyed into `requireOwnedDispatch` / release. No `clientKey` write on a dispatch id. |
+| `ownershipFor` lazy map create | Empty reg shell only; no dispatch ids until bind. |
+| Sender pin persist (`~/.orca-bridge-sender-pins.json`) | Unrelated to dispatch clientKey; pre-existing. |
+
+No other writers of dispatch `clientKey` remain. `runtimeId` is not used.
+
+### Defects closed
+
+1. **Fail closed on empty ownership.** `partitionMailbox`: empty owned set → `{ own: [], foreign: list, filtered: true }` (empty mailbox stays unfiltered empty).
+2. **Ownership not claimable.** `createDispatchRegistry().upsert` ignores `clientKey` and preserves prior owner; new `bindOwner` is the only bind API and refuses reassignment. Await never calls `bindOwner` / never passes claimable identity into upsert for foreign or unbound ids.
+
+### Restart / durability tension
+
+**Resolved by durable bindings, not by re-claim on read.**
+
+- New store: `ORCA_BRIDGE_AUDIT_DIR` (default `~/.orca-bridge`) + `dispatch-ownership.json`.
+- Written only from `bindOwnedDispatch` (dispatch-time).
+- Loaded at boot into registry + `clientOwnership` via `bindOwner` / `registerOwnedDispatch`.
+- Not keyed on `runtimeId` (changes across restarts; resolvers stay clean of it).
+- If the file is missing/unreadable after restart: **fail closed** on release/await ownership (same as wiped maps). That is the correct security posture; durability restores the legitimate coordinator path when the store is intact.
+- Coordinators that legitimately dispatched **can still release after restart** when the ownership file hydrates (covered by effect test). Pin file remains separate and still loads.
+
+### Tests
+
+- Baseline was **346 pass / 0 fail**.
+- This pass: **353 pass / 0 fail / 0 skipped** (`npm test`).
+- Real-path regressions (not policy-shape unit stubs):
+  - empty owned + foreign `worker_done` → partition foreign; claim upsert does not change `clientKey`; `requireOwnedDispatch` not owned; `executeReleaseWorker` zero effects.
+  - durable hydrate snapshot → owner still releases via `worker-release`; status upsert keeps `clientKey`.
+  - empty store → release fail-closed.
+  - `bindOwner` refuse reassignment; `upsert` never sets `clientKey`; `listOwnershipBindings` only bound rows.
+  - `partitionMailbox` empty-set fail-closed unit updated.
+
+### Sibling claim paths checked
+
+- MCP F5 orphan-read still fail-opens on **missing** `clientKey` for resource visibility — out of scope; does **not** grant `requireOwnedDispatch` (empty key is not owned). Left untouched.
+- `action=check` no longer registers runs into ownership.
+- Release `upsertDispatch` no longer passes `clientKey`.
+- No evidence of another read path that can forge `clientKey` after this change. If a future path calls `bindOwner` with caller identity outside dispatch/hydrate, that would re-open the class — grep for `bindOwner` / `clientKey:` in upsert patches in review.
+
+### Files
+
+- `lib/orch-isolation.mjs` — fail-closed `partitionMailbox`
+- `lib/audit.mjs` — non-claim `upsert`, `bindOwner`, `listOwnershipBindings`
+- `server.mjs` — `bindOwnedDispatch`, durable load/persist, await non-claim updates, remove await/check `registerOwnedDispatch`
+- `lib/release-worker.mjs` — status-only upsert (no `clientKey`)
+- `lib/*.test.mjs` — regressions above
+- this document (append only)
+
+Independent suite after fix: **353 pass / 0 fail / 0 skipped**.
