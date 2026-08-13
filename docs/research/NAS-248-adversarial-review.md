@@ -799,3 +799,275 @@ No other writers of dispatch `clientKey` remain. `runtimeId` is not used.
 - this document (append only)
 
 Independent suite after fix: **353 pass / 0 fail / 0 skipped**.
+
+---
+
+## Third adversarial review — P0 #4 claim-path verification — 2026-08-13
+
+**Reviewer:** dispatched attack worker, fresh (did not write `65f3a8a` or the two earlier reviews).  
+**Target:** `BuildContext/nas-248-ownership-invariant` @ `65f3a8a`  
+**Worktree:** `/home/orca/orca/workspaces/orca-mcp/nas-248-p0-4-verify` (reset to the target commit; sibling worktree already holds the branch name)  
+**Scope:** only N2 / P0 #4 (empty owned-set + await upsert forges `clientKey`) and the fix that claims to close it.  
+**Out of scope (not re-litigated, not made worse by this fix):** N1 / P0 #3 `terminal show --json` preview; N3 / P0 #5 `terminal stop --worktree`; hardening-OFF outside named prefixes; F3 `dispatch-show` metadata; F5 MCP orphan-read.  
+**Independent suite:** **353 pass / 0 fail / 0 skipped** (`npm test` on this commit; matches the implementer).  
+**Production code changed by this review:** no  
+**Bridge process touched:** no  
+**Live `~/.orca-bridge/dispatch-ownership.json`:** inspected read-only (file **does not exist** on this host). Not created, not written, not replaced.  
+**Destructive live `release` / `close` / `worker-release` / `worker-stop` / session kill:** not executed (NAS-202 boundary). Proofs are in-process against the production functions, or argv/CLI-spec proofs that the guard would let a shape through.
+
+Probe script: `/tmp/nas-248-p04-probe.mjs` (imports `lib/audit.mjs`, `lib/orch-isolation.mjs`, `lib/state-ownership.mjs`, `lib/release-worker.mjs` only — never `server.mjs`, which would `listen` and hydrate the live store).
+
+Treat every implementer claim as a hypothesis. Deliverable is shapes and results.
+
+### Verdict
+
+**The named await/check `clientKey` claim path is dead.** Empty `clientOwnership.dispatches` no longer fail-opens the mailbox; `upsert` cannot create or reassign `clientKey`; `await` / `check` no longer call `registerOwnedDispatch`; a subsequent `executeReleaseWorker` on the stolen id is `ownership_denied` with zero effects. I could not reproduce N2 against `65f3a8a`.
+
+**Ownership is still not a single chokepoint, and this fix introduced a new bind oracle.** Two sibling claim shapes are live in the production functions; neither is the await upsert the author named.
+
+1. **P0 — attacker-authored `dispatch-ownership.json` is fully trusted at boot.** `loadPersistedOwnership` is `bindOwner` + `registerOwnedDispatch` over whatever JSON is on disk. No signature, no schema beyond "object with two non-empty strings", no check that the client ever dispatched. In-process: a planted `{bindings:[{dispatchId: disp_bob, clientKey: alice, terminalHandle: term_bob}]}` makes `requireOwnedDispatch` / `requireOwnedHandle` return owned and `executeReleaseWorker` calls `worker-release`. Corrupt / empty / missing input fail-closes. The live file is absent; the directory is `0700`/`orca`. Same-uid writers (any worker shell on this host) can plant it; other OS users cannot. Hydration is boot-only.
+2. **P1 — `release` upsert still writes `terminalHandle`, and `null` clears a set handle.** Author said upsert "refuses terminalHandle overwrite when set" and "await/release upserts are status-only." False. `terminalHandle: null` is not stripped; `{...prev, terminalHandle: null}` erases the bind. A later owned-dispatch release whose post-gate lookup returns a foreign `assignee_handle` (caller-supplied `task_id`) first-writes that handle onto the attacker's row; `requireOwnedHandle` then returns owned. Live CLI `worker-release` is idempotent (`already_released` exits 0). Default `action=dispatch` is inject-path (`dispatch --inject`) where the first `worker-release` is typically `dispatch_not_found` (no upsert) — so this is not the default happy path. It is a real write in `executeReleaseWorker` whenever `worker-release` is `envOk` and lookup is empty, then later foreign.
+
+A green suite at 353/0 covers the named N2 shape at component level and does not call `awaitDispatch`, does not load a real/corrupt/attacker file through `loadPersistedOwnership`, and does not exercise the `terminalHandle: null` strip.
+
+---
+
+### Priority 1 — named P0 #4 (empty owned + await upsert) — **DEAD**
+
+In-process reconstruction of the second review's N2 probe against the new modules:
+
+| Step | Result |
+|------|--------|
+| bob `bindOwner(disp_bob)` | owned by bob |
+| alice `owned = empty Set` (restart / first await) | — |
+| `partitionMailbox([worker_done disp_bob], empty)` | `own=0 foreign=1 filtered=true` |
+| claim `upsert(disp_bob, {clientKey:alice})` | row still `clientKey=bob` |
+| `requireOwnedDispatch(disp_bob, alice)` | `ok:false status=not-owned` |
+| `executeReleaseWorker({dispatch_id: disp_bob})` | `ownership_denied`, **0** `runJson` calls |
+
+Grep of production callers:
+
+- `registerOwnedDispatch` is only invoked from `bindOwnedDispatch` and `loadPersistedOwnership`.
+- `awaitDispatch` / `action=check` do not call `registerOwnedDispatch` or `bindOwner`. Await upserts run only when `owned.has(did)` **and** `existing.clientKey === ck`.
+- `dispatchId` on `bindOwnedDispatch` comes from the runtime inject envelope, not from tool args. Caller cannot pre-bind a chosen foreign id via `action=dispatch`.
+
+`next.action=release` suppression still short-circuits on `owned.size > 0`, but the fail-closed partition now leaves `messages=[]`, so `summarizeMessages` has no `worker_done` to promote. That half of N2 is gone with the mailbox split.
+
+---
+
+### Attack 1 — surviving claim writers (every action / helper)
+
+Enumerated write sites that can create or mutate a binding:
+
+| Site | Reaches ownership store? | Claim? |
+|------|--------------------------|--------|
+| `action=dispatch` → `bindOwnedDispatch` → `bindOwner` + `registerOwnedDispatch` + `persistOwnershipBindings` | yes | Legitimate first bind of a **new** runtime id. `bindOwnedDispatch` failure is ignored by `dispatchWorker` (availability: victim thinks they dispatched; they are not in `clientOwnership`). |
+| `loadPersistedOwnership` at module load | yes | **Trusts file.** See P0 below. Boot only; not exported; not re-invoked. |
+| `action=await` upsert | yes, status only | Gated `owned.has` + `existing.clientKey === ck`. `clientKey` stripped. **No claim.** |
+| `action=check` | no registry write | `markRunBound` only. |
+| `action=release` upsert | yes, status + `terminalHandle` | No `clientKey`. **Handle write — see P1.** |
+| `action=health` / `guide` | no | — |
+| MCP `resources/list` / `resources/read` | no write | F5 read fail-open unchanged; `requireOwnedDispatch` still false on empty `clientKey`. |
+| `markRunBound` | writes `boundRunId` / `boundSender` on `clientOwnership` | `boundRunId` is **not** consulted by `requireOwnedDispatch` (held). `boundSender` **is** consulted by `collectTerminalHandleSets` → `requireOwnedHandle`. Live callers only pass `resolveSenderTerminal()` (own pin). Not a client-chosen handle. Author claim that it is "not keyed into release" is **false for handles**, true for dispatch ids. |
+| `ownershipFor` lazy map | empty shell | no ids |
+| Sender pin file | pre-existing; `senderCaches` already owns the pin handle | not introduced by this fix |
+
+`collectDispatchIdSets` is an OR of `clientOwnership.dispatches` **and** `registry.clientKey`. Either source is sufficient for `requireOwnedDispatch`. In-process: putting `disp_bob` in alice's `dispatches` set while the registry still says bob makes `executeReleaseWorker` call `worker-release`. The only production writers of that set are `bindOwnedDispatch` and hydrate. This is the mechanism behind the file P0, not an independent MCP action.
+
+No MCP resource or `action=cli` prefix calls `bindOwner`.
+
+---
+
+### Attack 2 — stripping as a defence
+
+`upsert` copies the patch, `delete safePatch.clientKey`, then forces `clientKey: prev.clientKey`.
+
+| Shape | Result |
+|-------|--------|
+| `clientKey` / `null` / `''` / `undefined` | stripped / preserved. **Held.** |
+| `ClientKey` / `client_key` / `CLIENTKEY` | stored as extra fields; resolvers read only `.clientKey`. **Held.** |
+| nested `{owner:{clientKey}}` | stored unused. **Held.** |
+| whole record `{clientKey, terminalHandle, ...}` | `clientKey` preserved; **different** `terminalHandle` refused while set. **Held.** |
+| array patch with `.clientKey` | no bind. **Held.** |
+| `JSON.parse('{"__proto__":{"clientKey":"alice"}}')` | no `Object.prototype` pollution on this Node; row `clientKey` unchanged. **Held.** |
+| `constructor.prototype` | stored unused. **Held.** |
+| new id + `upsert({clientKey:alice})` then `requireOwnedDispatch` | row has `clientKey=undefined`; `not-owned` (`foreign_dispatch` once listed). **Held.** |
+| `upsert` then `bindOwner` on unbound row | first writer wins (expected; not a client path unless they can call `bindOwner`). |
+| **`terminalHandle: null`** | **not stripped** (`!= null` is false). Clears a set handle. **Author claim false.** |
+| **`terminalHandle: ''`** | written (empty string fails the `!== ''` guard). Production uses `handle \|\| null`, so the live write is the null form. |
+
+No path bypasses `upsert`/`bindOwner` to the closed-over `Map`. `bindOwner` extra aliases (`owner`, `client_key`) do not satisfy `requireOwnedDispatch`.
+
+Latent footgun, not live: `bindOwnedDispatch` spreads `...extra` **after** `clientKey: ck`. If a future caller passes `extra.clientKey`, `bindOwner` binds that identity. `dispatchWorker` does not pass `extra`.
+
+---
+
+### Attack 3 — `~/.orca-bridge/dispatch-ownership.json` (new surface)
+
+**Who writes.** `persistOwnershipBindings` only, from `bindOwnedDispatch` (successful dispatch-time bind). `writeFilePreservingOwner` + `STATE_FILE_MODE = 0o600`. `mkdirSync(AUDIT_DIR, {recursive:true, mode:0o700})` only if the dir is missing. `writeFileSync` **follows symlinks** (no `O_NOFOLLOW`).
+
+**Live host (read-only).**
+
+| Path | State |
+|------|--------|
+| `ORCA_BRIDGE_AUDIT_DIR` | unset → `~/.orca-bridge` |
+| `~/.orca-bridge` | `0700` `orca:orca` (uid 997) |
+| `~/.orca-bridge/dispatch-ownership.json` | **missing** (this commit is not the running bridge) |
+| `~/.orca-bridge-sender-pins.json` | `0600` `orca:orca` (pre-existing sibling) |
+
+Other OS users cannot enter the directory. Every process as `orca` can. That includes every dispatched worker. Multi-tenant isolation on this bridge is `clientKey`, not uid — the new store is a same-uid shared secret.
+
+**Hydration.** Module-load, synchronous, before `listen`. Not re-run. Missing file → 0 (fail-closed). `JSON.parse` throw → 0. Then:
+
+```
+bindings = Array.isArray(raw.bindings) ? raw.bindings
+         : Array.isArray(raw)          ? raw
+         : [];
+```
+
+Undocumented top-level array is accepted.
+
+| Input | n | Gate after |
+|-------|---|------------|
+| `''` / truncated `{"bindings":[` | 0 + error | fail-closed |
+| `{}` / `[]` / `{bindings:null}` / `{bindings:"steal"}` / `{bindings:{dispatchId,clientKey}}` | 0 | fail-closed |
+| junk rows (null, 42, `""` keys) | skipped | fail-closed unless a row coerces |
+| `{dispatchId:123, clientKey:{x:1}}` | binds `123` as `"[object Object]"` | latent coerce; not a named client |
+| **attacker `{bindings:[{dispatchId:disp_bob, clientKey:alice, terminalHandle:term_bob}]}`** | **1** | **alice owns dispatch + handle; `executeReleaseWorker` → `worker-release`** |
+| top-level `[{dispatchId, clientKey}]` | 1 | same trust |
+| two bindings, same id | first `bindOwner` wins; second `owner_mismatch` skipped | plant alice first |
+| `__proto__` in a binding | no prototype pollution | extra keys stored on the row |
+
+There is no authenticity check. A valid-looking binding is authority. `registerOwnedDispatch` also copies `terminalHandle` into `workerHandles`, so handle close is granted without a second step.
+
+**Restart to activate.** A plant while the process is alive is overwritten by the next `persistOwnershipBindings` (full rewrite from `listOwnershipBindings()`). The durable claim is: process down → write file → process up. Workers can write the file. This review did not restart the live bridge.
+
+**MCP client cannot write the file** through await/check/dispatch/release/resources. A worker they themselves dispatched can.
+
+---
+
+### Attack 4 — fail-closed completeness (`partitionMailbox`)
+
+| Owned-set input | Result |
+|-----------------|--------|
+| `new Set()` | `own=[] foreign=list filtered=true` **held** |
+| `null` / `undefined` / `[]` / string `"disp_bob"` | coerced to empty Set → fail-closed **held** |
+| Set of unknown ids / empty/null ids | bob stays foreign **held** |
+| Set containing only alice's id | bob foreign; alice-id message own **held** |
+| `pick` throws | throws (await is not in a catch around partition → RPC error, not allow) **held** |
+| `messages=null` + empty owned | empty/unfiltered **held** |
+| non-object messages + nonempty owned | go to `own` (documented; upsert skips `!did`) |
+
+No fail-open analogue of N2 found. Resolver throw on `registry.list` is swallowed → unknown fail-closed. No hydrate/request race: load is sync at import, before `listen`.
+
+---
+
+### Attack 5 — opposite failure (legitimate release after restart)
+
+| Check | Result |
+|-------|--------|
+| Hydrate `listOwnershipBindings` snapshot → `requireOwnedDispatch` + `executeReleaseWorker` | **allowed**, `mode=worker-release`, `clientKey` preserved. `runtimeId` passed as deps noise is ignored. |
+| Empty / missing store | `ownership_denied`, 0 effects. Intentional availability tradeoff. |
+| Live store on this host | missing. A coordinator on a bridge that has not yet dispatched under this build will fail-closed after restart until they dispatch once (file created) or the file is planted. |
+| `runtimeId` as a resolver key | none. **Held.** |
+
+The restart case that justified the original upsert is restored **only when the file hydrates intact**. That is also why the file is now a claim oracle.
+
+---
+
+### Attack 6 — the 7 new tests
+
+Baseline 346 → 353 is +7 as claimed. Names:
+
+1. `upsert never sets or overwrites clientKey` — registry unit.
+2. `bindOwner refuses reassignment` — registry unit.
+3. `bindOwner is idempotent for the same owner` — registry unit.
+4. `listOwnershipBindings only exports bound rows` — registry unit.
+5. `empty owned set + claim upsert … release refused` — `partitionMailbox` + `upsert` + `requireOwnedDispatch` + `executeReleaseWorker`. This **is** the N2 shape and would catch a regression of the named P0.
+6. `legitimate owner can still release after durable hydrate` — replays `listOwnershipBindings` through `bindOwner` by hand. Does **not** run `loadPersistedOwnership`, does not touch a file, does not feed corrupt/attacker JSON.
+7. `empty store … fail-closes release` — `executeReleaseWorker` with empty maps.
+
+None of them import or call `awaitDispatch`. If await still called `bindOwner` or `registerOwnedDispatch`, tests 1–5 would still pass. I confirmed those calls are gone by grep, not by the suite.
+
+None of them: null-clear `terminalHandle`; foreign `task_id` lookup after clear; attacker-authored file; `boundSender` → `requireOwnedHandle`; dual-source OR.
+
+This is how five P0s survived three green suites: the suite agrees with the objects the author built.
+
+---
+
+### Lead findings (this round)
+
+### V1 — P0 — persist file is a `bindOwner` oracle
+
+Reproduction (in-process; do **not** write the live file):
+
+```
+raw = { version:1, bindings:[{ dispatchId:'disp_bob', clientKey:'alice', terminalHandle:'term_foreign_bbbbbbbb' }] }
+loadPersistedOwnership replica → bindOwner + registerOwnedDispatch
+requireOwnedDispatch('disp_bob','alice') → owned
+requireOwnedHandle('term_foreign_bbbbbbbb','alice') → owned
+executeReleaseWorker({dispatch_id:'disp_bob', terminal_handle:'term_foreign_bbbbbbbb'})
+  → ok, mode=worker-release, argv contains worker-release --dispatch disp_bob
+```
+
+Corrupt/empty/missing fail-closed. Attacker-authored valid JSON fail-opens. Same-uid worker can plant; other users cannot (`0700`/`0600`). Needs a restart to load. This class did not exist before the fix — restart previously wiped maps (fail-closed).
+
+### V2 — P1 — `terminalHandle: null` is an ownership write; foreign lookup can first-write
+
+`executeReleaseWorker` after a successful `worker-release`:
+
+```
+upsertDispatch(dispatchId, { status:'released', mode:'worker-release', terminalHandle: handle || null })
+```
+
+In-process:
+
+1. alice owns `disp_alice` with `terminalHandle=term_own`.
+2. Release with no handle; lookup returns `{}`; `worker-release` ok → row `terminalHandle=null`.
+3. Release again with `task_id=task_bob`; `dispatch-show --task` returns `assignee_handle=term_foreign`; `worker-release` ok (live CLI: `already_released` exits 0) → row `terminalHandle=term_foreign`.
+4. `requireOwnedHandle(term_foreign, alice)` → **owned**.
+
+Default `action=dispatch` is inject-path; first `worker-release` is typically `dispatch_not_found` and this upsert does not run. Supervised `worker-release` that succeeds with an empty lookup **does**. Author: "refuses terminalHandle overwrite when set" / "status-only" — **inaccurate**.
+
+### V3 — author claim: `markRunBound` is not ownership — **half false**
+
+`collectTerminalHandleSets` treats `reg.boundSender` as owned. In-process, `boundSender=term_foreign` makes `requireOwnedHandle` return owned (dispatch id still not-owned). Live `markRunBound` only stores `resolveSenderTerminal()` — the client's pin, already owned via `senderCaches`. Not a client-chosen foreign handle. It is still an ownership write by another name, and the author's "not keyed into release" sentence is false for the handle half.
+
+---
+
+### Implementer-claim scorecard (this commit)
+
+| Claim | Accurate? |
+|-------|-----------|
+| `partitionMailbox` fail-closes on empty owned set | **Yes.** Also null/undefined/string/unknown-only. |
+| `upsert` strips `clientKey`; only `bindOwner` binds | **Yes** for `clientKey`. |
+| `upsert` refuses `terminalHandle` overwrite when set | **No.** `null` (and `''`) clear it. Different non-empty handle is refused. |
+| `await` / `check` no longer `registerOwnedDispatch` / cannot claim | **Yes.** Grep + N2 replay. |
+| Write-site audit: bind/hydrate legitimate; await/release status-only; `markRunBound` not ownership | **No.** Release writes `terminalHandle`. Hydrate trusts unauthenticated JSON. `boundSender` is a handle-ownership input. |
+| Restart durability restored; no `runtimeId`; missing store fail-closes | **Yes**, when the file is intact. The intact-file premise is the V1 oracle. |
+| Tests are real-path (attempt claim, assert store not written, release refused) | **Only for N2 components.** Not `awaitDispatch`. Not the file. Not `terminalHandle`. |
+| No other claim path remains | **No.** V1 (file) and V2 (handle upsert) are unnamed siblings of the named list. |
+
+---
+
+### What I would not call a break
+
+- Closing N2. It is closed. Empty owned + await-shaped `clientKey` upsert does not own, and release does not fire.
+- Alias / case / proto smuggles into `upsert`. Resolvers only read `.clientKey`.
+- F5 orphan read still listing unbound rows. Still does not satisfy `requireOwnedDispatch`. Out of scope.
+- `boundSender` unit-owning a handle when the live caller cannot choose the handle.
+- Dual-source OR as a standalone MCP action — no remaining writer except bind/hydrate.
+- `bindOwnedDispatch(...extra)` clientKey clobber — not passed from `dispatchWorker`.
+- Soft-mode `terminal show` / `terminal stop` (P0 #3 / #5). Untouched; not worse.
+- A 353-green suite. Expected, and consistent with V1/V2.
+
+---
+
+### Recommendation (not implemented — review is append-only)
+
+1. **Treat V1 as blocking for the durability story.** Bindings in `dispatch-ownership.json` must not be trusted because a file exists. Minimum: refuse hydrate unless the process (not a worker) wrote the last snapshot (counter/hmac under the service key, or keep the file `0600` **and** stop treating it as cross-client authority — e.g. per-`clientKey` files not writable from worktrees). Document that same-uid workers can currently become any coordinator after the next restart.
+2. **Treat V2 as blocking for "upsert is non-claiming."** Never write `terminalHandle` from release. If you keep a handle field, apply the same "set only when empty, never null-clear, never different value" rule that the comment already claims. Drop `task_id` lookup that can supply a handle the preflight did not judge, or re-run `requireOwnedHandle` on the looked-up value **before** the upsert (the close path already re-checks; the worker-release success path does not).
+3. Drive `awaitDispatch` in a test (mocked `runJson` mailbox) so a future `bindOwner`/`registerOwnedDispatch` on the read path fails the suite. Add a file-hydrate test that feeds attacker JSON through the real parse (not a hand-replay of `listOwnershipBindings`). Add a `terminalHandle: null` strip test.
+4. Do not merge under "P0 #4 is fixed, 353 green." The named await claim is fixed. The store you added to replace it is a bind API on disk.
+
+Independent suite this review: **353 pass / 0 fail / 0 skipped**.
