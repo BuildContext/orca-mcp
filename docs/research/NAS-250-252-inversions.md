@@ -1338,3 +1338,306 @@ MUT3: FAIL (target-capable resolver test); evaluate → allow_with_warning
 - `--json=false` gate-vs-CLI token meaning left open (refused above).
 
 Attack surface covered this wave: Items 1–5 code paths; MUT1/2/3 on real files; full `npm test` 427/0; closeout effect tests for group addresses, content-flag allow, computer id value rule, linear allow, HELD smoke.
+
+# Adversarial review of `a119214` — try to break the closeout (FINAL / r10)
+
+**Reviewer:** dispatched attack worker (NAS-252 review-final, fresh eyes)  
+**Target:** `BuildContext/nas-248-ownership-invariant` @ `a119214`  
+**Worktree:** `/home/orca/orca/workspaces/orca-mcp/nas-252-review-r9` (already on the target; this review only appends this section)  
+**CLI oracle:** live AppImage v1.4.180 (`/tmp/nas-248-cli/squashfs-root/.../out/cli`) `specs/index.js` `COMMAND_SPECS` + `handlers/automations.js`  
+**Date:** 2026-08-13  
+**Production code changed by this review:** no (MUT1–4 edited real files, then restored; md5 of `lib/cli-policy.mjs` after restore = `4b1392879216cf9d65068258fd3aed94` = `HEAD`)  
+**Live shared bridge process touched:** no  
+**`ORCA_BRIDGE_CLI_HARDENING` on the live bridge:** not flipped  
+**`~/.orca-bridge/` / `~/.orca-bridge-sender-pins.json`:** not modified (isolated HOME copies under `/tmp/nas-252-r10-iso/home` only)  
+**Destructive live `stop` / `release` / `close` / `worker-start` / `tab close` / `task-update` / `gate-resolve` / `reply` / `send --to @all` / `automations remove|run` / `artifacts delete`:** not executed (NAS-202 boundary). Those shapes are argv-proof and/or isolated-HOME + fake-`orca` only.
+
+This review treats every closeout claim at `a119214` as a hypothesis. A green suite is not evidence. Ten prior rounds in this lineage shipped live P0s behind 321 / 346 / 353 / 353 / 388 / 406 / 419 / 427. Three times the failure was a green test asserting on a weaker object than the claim.
+
+## VERDICT
+
+**BREAKABLE. Do not merge to main.**
+
+Items 1, 3 and 5, the four round-9 *coordinator* regressions, and HELD 1–21 *as written* are genuinely closed on the production `action=cli` spawn path, not just on helpers. Isolated-HOME HTTP (`PORT=18789/18790/18791`, fake `orca`, `HOME` under `/tmp/nas-252-r10-iso/`) refused to spawn `--to @all`, `--to @worktree:path:/foreign`, `terminal show --terminal term_FOREIGN`, `automations show auto_FOREIGN`, `computer permissions --id task_FOREIGN`; spawned `orchestration inbox --terminal <pin> --json` with `subject`/`body`/`payload` stripped; overwrote caller `--from term_FOREIGN` with the pin; withheld human stdout (`output_withheld=true`, static diagnostic, no secret); and refused `action=release` of `ctx_FOREIGN_RELEASE` / `term_FOREIGN_RELEASE` before any worker-release/close. Independent suite at `a119214`: **427 pass / 0 fail**. That number is still not evidence.
+
+The inversion is still not closed. Item 4 *removed* value-scanning from every flag that is not in the five-name `VALUE_TYPED_ONLY` set. `--workspace` is classified `NON_TARGET` (a "content" sibling only by table membership) but the shipped v1.4.180 spec and handler treat it as a worktree selector: *«Use --workspace to run in an existing worktree»* / `getOptionalWorktreeSelector(flags, 'workspace', …)`. At `a2a715d` the universal value-scan routed `path:` / `name:` / `branch:` / `issue:` / `id:` values on *any* flag into `worktreeOwnershipCheck`. After Item 4 that scan is gone, so:
+
+```
+evaluateCliArgv(['automations','create','--workspace','path:/foreign', …],
+                {hardening:false, admin:true, all-checkers-not-owned})
+→ { decision:'allow_with_warning' }
+
+# isolated action=cli spawned:
+['automations','create','--name','x','--trigger','daily','--prompt','p',
+ '--provider','g','--workspace','path:/foreign','--json']
+```
+
+Hardening on is an *allowlist* deny (`automations create` is on neither `RAW_CLI_OK` nor `RAW_CLI_ADMIN`), not an ownership deny. Default `ORCA_BRIDGE_CLI_HARDENING` is unset. NAS-252's rule is that ownership must not be load-bearing on the allowlist. This is the r9 `@worktree:` P0 in a different spelling, created by the loosening the author billed as a false-deny fix.
+
+MUT1/MUT2/MUT3 all FAIL as claimed. The invented fourth mutation (content-named address flag) PASSES: add `recipient` to `NON_TARGET_FLAGS` + a spec that takes it, and `spec differential` stays 3/3 green while `synthetic deliver --recipient term_FOREIGN` is `allow_with_warning`. `--workspace` is that mutation already shipping.
+
+## Mutation-test of the differential lock (real file edits, restored)
+
+`node --test --test-name-pattern 'spec differential'` against the real files, then restore. Baseline: **3 pass / 0 fail**.
+
+| Mutation | How | Result | Teeth? |
+|----------|-----|--------|--------|
+| MUT1 — new positional | prepend `{path:['synthetic','show'], positionalArgs:['secretid'], allowedFlags:[…,'secretid']}` to `CLI_COMMAND_SPECS` | **FAIL** 2/3 (`unclassified shipped flags: secretid` + `positional flag not in FLAG_TABLE`) | Yes, for a *new unclassified name* |
+| MUT2 — new flag, no resolver | prepend `{path:['synthetic','run'], allowedFlags:[…,'nonesuch-flag']}` | **FAIL** 1/3 (flag-table classification) | Yes, for an unclassified flag |
+| MUT3 — remove id resolver | delete `id: 'id'` from `TARGET_FLAG_RESOLVERS`; add `'id'` to `NON_TARGET_FLAGS` | **FAIL** 1/3 — `target-capable` test (`--id must be kind=target, got non_target`). Then `evaluateCliArgv(['automations','show','auto_FOREIGN'])` → `allow_with_warning` | **Yes.** MUT3 is no longer decoration. |
+| MUT4a — reclassify address `--to` as content | delete `to: 'handle'` from `TARGET_FLAG_RESOLVERS`; add `'to'` to `NON_TARGET_FLAGS` | **FAIL** 1/3 (`--to must be kind=target, got non_target`). Evaluate `--to @all` still **deny** (`VALUE_TYPED_ONLY` is a separate hardcoded set and does not consult `FLAG_TABLE.kind`) | Yes for the *named* address flag. Defense-in-depth: table demotion does not reopen `@all`. |
+| MUT4b — new address flag whose name resembles content | add `'recipient'` to `NON_TARGET_FLAGS`; prepend spec `{path:['synthetic','deliver'], positionalArgs:['recipient'], allowedFlags:[…,'recipient']}` | **PASS** 3/3. `FLAG_TABLE.recipient = {kind:'non_target'}`. `evaluate --recipient term_FOREIGN` and positional `synthetic deliver term_FOREIGN` → `allow_with_warning` | **No. Enumeration.** `TARGET_CAPABLE` is a hardcoded name list, not "targets the CLI resolves." |
+| MUT4c — stub the advertised `resolvers.worktree` map to always-owned | replace `worktree: worktreeOwnershipCheck` in the completeness map | **PASS** 3/3. Evaluate `@worktree:path:/foreign` and `stop --worktree path:/foreign` still **deny** | The map is a completeness table. Production `runChecker` calls `worktreeOwnershipCheck` from config, not `resolvers.worktree`. |
+| MUT4c2 — always-owned at the *real* call site | replace the `worktree` `runChecker` argument with `() => ({status:'owned'})` | **spec differential PASS 3/3**. Closeout test `denies --to @all and routes @worktree through worktree checker` **FAILS**. Evaluate `@worktree:path:/foreign` → **allow**; `stop --worktree path:/foreign` → **allow_with_warning** | Differential lock does not bind the resolver implementation. The closeout *effect* test binds `@worktree` specifically. Nothing binds `--workspace`. |
+
+**Runtime source of specs:** `CLI_SPEC_VERSION = "1.4.180"`, 228 unique paths, 0 duplicate paths (dedupe holds). Compared this review to live `COMMAND_SPECS`: `onlyLive=[]`, `onlySnap=[]`, `nDiffs=0` on `path` / `positionalArgs` / `allowedFlags`. Snapshot currently matches. The version test fails if the pin is not the string `1.4.180`; it still does not `require` the AppImage at runtime.
+
+## Method
+
+- Diffed `a8d3b42..a119214` (via reading closeout + current sources). Read `evaluateCliArgv` value-typed block, `VALUE_TYPED_ONLY`, `--id` orch-grammar filter, `FLAG_TABLE` construction, `applyOwnershipListRedaction` / `tryParseWalkableJson` / `redactTerminalListHumanStdout` stub, `classifyValueOwnershipKind` / `stripAddressPrefix`, `withSender` / `ensureWalkableCliArgv` / `action=cli` (`server.mjs:2541–2569`), `executeReleaseWorker` ordering, v1.4.180 `specs/automations.js` + `handlers/automations.js`.
+- Mutation-tested the three differential tests on the real files (MUT1/2/3 + invented MUT4a/b/c/c2). Compared snapshot to live `COMMAND_SPECS`.
+- Enumerated every v1.4.180 spec flag classified `non_target` whose *name* is selector-ish (`workspace`, `selector`, `destination`, `to-id`, `parent-id`, `reply-to`, `thread-id`, `environment`, `path`, `file`, …) and checked the live handler for each.
+- Isolated-HOME HTTP bridge (`HOME=/tmp/nas-252-r10-iso/home`, `PORT=18789+`, `ORCA_CLI_COMMAND=/tmp/nas-252-r10-iso/fake-orca`, `ORCA_BRIDGE_SENDER_TERMINAL=term_iso_pin`). Drove `tools/call` `action=cli` and `action=release`. Asserted on **spawned argv** (fake-orca jsonl) and **caller SSE payload** (`content[0].text`). Did not write `~/.orca-bridge*`.
+- Re-ran the r9 catalogue through `evaluateCliArgv` hardening on **and** off, plus spawn-path for `@all` / `@worktree` / `--workspace` / `file open path:` / inbox / list / deny-show / reply `--from` / release / human withhold.
+- Independent `npm test` at `a119214`: **427 / 0**.
+
+Probe: `/tmp/nas-252-r10-probe.mjs` → `/tmp/nas-252-r10-probe-out.json`. Mutations: `/tmp/nas-252-r10-mutation.sh`. Isolated spawn + payloads: `/tmp/nas-252-r10-iso/`.
+
+## Prior-reproduction scorecard (re-run against `a119214`, not trusted from the closeout)
+
+| Prior finding | `evaluateCliArgv` @ a119214 (hard off / on) | Isolated `action=cli` spawn? | Genuinely dead? |
+|---------------|---------------------------------------------|------------------------------|-----------------|
+| r9 P0-1 `--to @all` | deny / deny (`unowned_group_address`) | **not spawned**; caller `cli_policy_denied` / `handle_not_owned` | **Dead** (also `@ALL`, `@everyone`, `@worktree` without `:`, `@worktree:`, leading/trailing space, bare `all`, `*`) |
+| r9 P0-1 `--to @worktree:path:/foreign` | deny / deny (worktree checker) | **not spawned** | **Dead** for the `--to` spelling |
+| r9 P0-1 `--to @worktree:path:/own` | allow / allow (owned checker) | isolated checker has no owned worktree → deny (fail-closed) | **Holds** when the checker says owned |
+| r9 P1-1 MUT3 | n/a (test) | n/a | **Dead** — MUT3 now fails |
+| r9 P1-2 human/exception output | n/a (output) | human fake-orca `terminal list` → `output_withheld=true`, static note, secret absent | **Dead** as a leak. New fail-closed withhold of owned human (see Regressions) |
+| r9 P1-3 `computer permissions --id task_FOREIGN` | deny / deny | **not spawned** | **Dead** |
+| r9 P1-3 `computer permissions --id accessibility` | allow_with_warning / allowlist deny | **spawned** `--id accessibility --json` | **Fixed** as a false *ownership* deny |
+| r9 P1-3 `--ack` non-`delivery_*` | `ack_FOREIGN` deny; UUID allow / allow | UUID spawned `check --ack <uuid> --terminal <pin> --json` | **Dead** for underscore orch ids. UUID residual author-declared (P2) |
+| r9 regression: `linear issue NAS-252` | allow_with_warning / allowlist deny | **spawned** `linear issue NAS-252 --json` | **Fixed** (no longer ownership-deny) |
+| r9 regression: owned reply/send/term-send with token-shaped content | allow / allow | reply spawned with `--from <pin>`; term-send spawned | **Fixed** |
+| r7/r9 `automations show <id>` | deny / deny | **not spawned** | **Dead** |
+| r7/r9 inbox `--json`/`--full`/no flag | allow_with_warning / allowlist deny (pin is post-policy) | **spawned** `inbox --terminal <pin> --json`; foreign row stripped to `id/from_handle/to_handle/run_id` | **Dead on spawn path** |
+| r7 `--to term_*` / `run:` / `dispatch:` | deny / deny | **not spawned** | **Dead** |
+| r7 unscoped `worker-list` / `run-list` | deny / deny | **not spawned** | **Dead** |
+| r9 `file open path:/foreign` | **allow_with_warning / allowlist deny** | **spawned** `file open path:/foreign --json` | **Reopened by Item 4** — see P1-2 |
+| r9 `file open /abs` | allow_with_warning / allowlist deny | **spawned** | Unchanged; author-declared |
+| New: `automations create --workspace path:/foreign` (and `name:` / `branch:` / `id:`) | **allow_with_warning / allowlist deny** | **spawned** with `--workspace` intact + `--json` | **Live. P0-1** |
+
+## Findings (ranked)
+
+### P0-1 — Item 4 un-gates the shipped `--workspace` worktree selector
+
+Item 4 claim: "Value-typed scan now runs **only** on `VALUE_TYPED_ONLY` address flags. Content flags … are not value-scanned. Address flags were not loosened."
+
+`--workspace` is not a content flag. v1.4.180 `specs/automations.js`:
+
+> Use `--workspace` to run in an existing worktree; otherwise the automation creates a new worktree per run.
+
+`handlers/automations.js` calls `getOptionalWorktreeSelector(flags, 'workspace', cwd, client)` — the same selector grammar as `--worktree` (`path:`, `name:`, `branch:`, `issue:`, `id:repo::path`, absolute paths). `FLAG_TABLE.workspace = { kind: 'non_target', resolver: null }`. It is not in `VALUE_TYPED_ONLY` and not in `TARGET_CAPABLE`.
+
+At `a2a715d` the universal value-scan did this for every flag:
+
+```js
+// a2a715d
+if (vk === 'worktree') {
+  const pathLikeFlag =
+    name === 'worktree' || name === 'parent-worktree' ||
+    String(raw).startsWith('path:') ||
+    /^(name|branch|issue|id):/.test(String(raw));
+  …
+  note(vk, [v]);
+}
+```
+
+So `--workspace path:/foreign` / `name:secret` / `branch:feat/secret` / `id:repo::/home/other/secret` entered `worktreeOwnershipCheck`. Item 4 deleted that loop's application to non-`VALUE_TYPED_ONLY` flags. The `--workspace` spelling of NAS-251 is now unowned.
+
+**Reproduction (argv-proof + isolated spawn; not live-executed against a real foreign worktree):**
+
+```
+evaluateCliArgv(
+  ['automations','create','--name','x','--trigger','daily',
+   '--prompt','p','--provider','g','--workspace','path:/foreign'],
+  {hardening:false, admin:true, all-checkers-not-owned})
+→ { decision:'allow_with_warning' }
+
+# hardening true: deny, reason = allowlist ("automations create" not on RAW_CLI_*),
+#                 NOT handle_not_owned
+
+# isolated action=cli (HOME=/tmp/nas-252-r10-iso/home, fake orca):
+spawned:
+  ['automations','create','--name','x','--trigger','daily','--prompt','p',
+   '--provider','g','--workspace','path:/foreign','--json']
+caller envelope: { ok:true, result:{} }   # walker stripped prompt/workspace keys
+                                          # (no handle on the node) — the SIDE EFFECT
+                                          # is the bug, not the echo
+```
+
+Same allow for `--workspace name:secret`, `branch:feat/secret`, `id:repo::/home/other/secret`, and a bare absolute `/home/other/secret`.
+
+`automations edit --id auto_* --workspace path:/foreign` still *denies*, but on `--id` (orch-id grammar), not on `--workspace`. Create has no `--id`. That is the hole.
+
+Linear commands also accept `--workspace`; that flag is a Linear workspace UUID, not `getOptionalWorktreeSelector`. Out of this P0. The automations spelling is the worktree one.
+
+Hardening is not load-bearing. Isolated and default `resolveCliPolicyConfig({})` both have `hardening=false`. Default `createToolsetGate` enables `admin`. `automations` is not on the admin allowlist either — the only thing that used to make this an ownership deny was Item 4's predecessor scan.
+
+Not live-executed against the shared runtime (would be a cross-coordinator schedule/write).
+
+### P1-1 — the differential lock is still an enumeration (MUT4b)
+
+MUT3 is fixed. The new test asserts `TARGET_CAPABLE` — a handwritten set of 16 names — have `kind==='target'` and a matching `TARGET_FLAG_RESOLVERS` entry, plus the `automations show auto_FOREIGN` effect. It does **not** assert that every flag a shipped handler uses as a selector is in that set.
+
+MUT4b (content-named address flag `recipient` as `NON_TARGET` + spec) stays 3/3 green and reopens a positional class. `--workspace` is the live instance: already in `NON_TARGET_FLAGS`, already on two shipped specs, already unbound. Adding it to `TARGET_CAPABLE` is the missing assertion; the tests will not fail until someone writes that line.
+
+MUT4c2 shows the same shape on the resolver *implementation*: stub the real `worktree` `runChecker` to always-owned and the differential tests stay green. The closeout `@worktree` effect test catches *that* spelling only.
+
+This is the third time in the lineage a green test asserted on a weaker object than the claim (`redactTerminalListPayload` vs the response boundary; `injectSenderArgv` vs `withSender`; `FLAG_TABLE` membership vs resolver binding; now `TARGET_CAPABLE` membership vs "every selector the CLI resolves").
+
+### P1-2 — `file open path:/foreign` is allow again
+
+r9 scorecard: "`file open path:/foreign` *does* deny." Author-declared exception at `a2a715d` was **bare absolute** on `--path` / `--file`, not the `path:` selector grammar. Item 4 dropped the `path:`/`name:`/`branch:`/`issue:`/`id:` scan on non-address flags.
+
+```
+evaluate ['file','open','path:/foreign'] → allow_with_warning / hardening allowlist deny
+isolated action=cli spawned ['file','open','path:/foreign','--json']
+```
+
+`file open /abs` is unchanged (author-declared). Positional promotion puts the token on `--path` or `--file`, both `NON_TARGET`. Live handler uses it as a filesystem path, optionally scoped by `--worktree` (which *is* still gated). `path:/foreign` without `--worktree` is the worktree-selector spelling of "open something over there."
+
+Not a host-wide inventory dump. Ranked P1, not P0: it is a foreign open, it was explicitly dead last round, and Item 4 reopened it, but it is not the automations schedule/write.
+
+Same loosening class, weaker effect, also spawn-proven: `environment show --environment path:/foreign`, `project setup-clone --destination path:/foreign`. Those handlers do **not** call `getOptionalWorktreeSelector` (environment name / clone destination). Recorded as P2 residuals, not additional P0s.
+
+### P2-1 — `--ack` UUID still skips ownership
+
+`check --ack aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee` → allow (on and off). Isolated spawned `check --ack <uuid> --terminal <pin> --json`. Author-declared: tokens outside orch-id grammar are "not an ownership target." Live inbox rows use `msg_*` / `delivery_*` (both deny). Residual, same as r9, now explicit.
+
+### P2-2 — `--json=false` semantic drift; snapshot is still a pin
+
+Refused by the author this wave. Live CLI `flags.has('json')` still treats the token as JSON; `ensureWalkableCliArgv` treats any `--json=*` as already walkable. Not a bypass today. Snapshot equals live 1.4.180 (0 path/flag/positional diffs) and the version test fails on the string `1.4.180` only — it will not notice a future AppImage bump until someone edits the pin.
+
+### P2-3 — advertised `resolvers` map is not the binding
+
+See MUT4c/MUT4c2. Completeness-checked, unused for dispatch. Hygiene. The closeout `@worktree` test is what actually binds that path.
+
+### P2-4 — inventory-allowlist string values still pass through walkable JSON
+
+`{"error":"SECRET"}` / other allowlisted keys with string values are not walked (only objects recurse). `error.message` as a nested object *is* stripped (`message` ∈ `NON_OWNED_STRIP_EXTRA`). Pre-existing inversion-B residual; Item 3 did not make it worse (human/partial/binary now withhold instead of leaking via the broken rewriter). Confirmed this review: parseable `{preamble:SECRET}` → `{ok,result:{}}`; `{secret,title}` → `{}`; `[SECRET,'x']` → `[]`; stderr `error: SECRET` → withheld.
+
+## Author claims that are inaccurate
+
+| Claim at `a119214` | Reality |
+|--------------------|---------|
+| "Address flags were not loosened." | `--to`/`--ack`/`--retry-of`/`--parent`/`--resume` were not. `--workspace` is a shipped worktree *address* that was only gated by the scan Item 4 deleted. That *is* an address-flag loosening, just of a flag the table had misfiled as `non_target`. |
+| "MUT1, MUT2 and MUT3 now ALL fail" / lock on resolver binding | **True for MUT1–3** (re-run). **False** that the lock equals "targets the gate sees = targets the CLI resolves." MUT4b (content-named address) and the live `--workspace` flag stay green. MUT4c2 (always-owned call site) stays green on the differential tests. |
+| "HELD 1–21 all pinned" | True of the 21 items *as written* (re-probed; HELD 11 re-driven). The items name `--worktree` / `--to @worktree:` / positional `automations show`. They do not name `--workspace`. The invariant those items exist to protect is still broken in that spelling. |
+| "Four round-9 coordinator regressions fixed" | **True.** `linear issue NAS-252`, token-shaped `--body/--text/--subject/--payload/--dispatch-capability`, `computer permissions --id accessibility`, and the `@all` / `@worktree:` send path are no longer false-denies or bypasses (see Regressions). |
+| "The human fallback rewriter is DELETED; unwalkable output … body withheld" | **True** on unit and isolated spawn. Human `terminal list` → `output_withheld=true`, note has no secret, exit code kept. Owned *human* bodies are also withheld (fail-closed; see Regressions). Walkable owned JSON/envelopes still walk. |
+| "Value scanning removed from CONTENT flags … retained on address/selector flags only" | Half true. Retained on the five `VALUE_TYPED_ONLY` names. Not retained on `--workspace`, which is a selector. No sibling-matching heuristic exists — "content" is `NON_TARGET_FLAGS` membership. An address flag is misclassified into that set by whoever appends the name, not by resemblance (`to-id` / `to-x` / `thread-id` are explicit). |
+| Suite **427 / 0** | **Accurate.** Independent rerun below. Not evidence. |
+
+## Regressions (not bypasses)
+
+These are ship-relevant even when they are fail-closed. Isolated/unit, not live-executed against foreign objects.
+
+The four round-9 coordinator breaks are **gone**:
+
+1. `linear issue NAS-252` / `linear issue --id NAS-252` — no longer `handle_not_owned`. Isolated spawned.
+2. Owned `reply --body term_FOREIGN`, `terminal send --text term_FOREIGN`, `send --subject/--payload term_FOREIGN`, `send --dispatch-capability ctx_FOREIGN` — allow when the *address* is owned. Isolated reply/send spawned; `--from` still overwritten.
+3. `computer permissions --id accessibility` — not an ownership deny. Isolated spawned. (`--id task_FOREIGN` still denies.)
+4. `@all` / `@worktree:path:/foreign` — deny, not spawned.
+
+Legitimate coordinator argv re-tested **allow** (hard off, owned checkers) and/or isolated spawn: `terminal list --worktree path:/own`, `worktree show --worktree path:/own`, owned `read`/`send`, owned `check`, `run-list --run run_own` (allow_with_warning / hardening allowlist-deny — unchanged), `worktree list --repo my-repo`, `--to @worktree:path:/own`. Isolated list: owned row keeps `title`/`worktreePath`/`preview`; foreign row is `{handle,connected,writable}` only.
+
+New fail-closed behavior (not a bypass):
+
+5. **Owned human stdout is withheld.** `applyOwnershipListRedaction` withholds any non-JSON stdout, including ordinary human output of an owned command. Isolated `FAKE_MODE=human terminal list` returned `output_withheld=true` and the static note. Force-`--json` is the production path (`ensureWalkableCliArgv`); commands that ignore `--json` now lose their body. Better than the r9 rewriter leak; coordinators that relied on human format via `action=cli` are darker.
+
+`action=release` **re-driven** (HELD 11), not just read:
+
+- Unit `executeReleaseWorker({dispatch_id:'ctx_FOREIGN_RELEASE'})` and `({terminal_handle:'term_FOREIGN_RELEASE'})` returned `ownership_denied` with **zero** `runJson` calls.
+- Isolated HTTP `action=release` / `dispatchId=ctx_FOREIGN_RELEASE` returned `mode=ownership_denied`, `reason=dispatch_not_in_registry`, no worker-release/close spawn. `ensureRuntimeReady()` may probe `status --json` before the wrapper (NAS-246 lazy status); that is not a teardown. Missing ids throw `dispatch_id (or terminal handle) is required` before effects.
+
+## HELD — still hold, must not regress
+
+Re-probed at `a119214` (unit + isolated spawn where noted). Keep all 21 from r9:
+
+1. `terminal show --json --terminal <foreign>` (space, `=`) → deny, `handle_not_owned`, on and off. Isolated: **not spawned**; caller `cli_policy_denied`.
+2. Same for `terminal read` / `close` / `send` / `wait` / `switch` / `rename` / `split` with foreign `--terminal`. Positional `terminal show <handle>` fail-closes.
+3. `terminal stop --worktree <foreign>` and `path:` / `name:` / `id:repo::path` / `branch:` / `issue:` → deny, on and off. (**`--workspace` is not this item.**)
+4. Duplicate `--terminal` / `--worktree` deny-any.
+5. Interleaved `orchestration --json worker-read --dispatch FOREIGN` still enters the dispatch checker (not re-broken).
+6. Missing checker + present collected selector → deny (never soft-exec). Unit: `terminal show --terminal term_x` with no checkers → deny `handle_not_owned`.
+7. JSON walk on list/show: isolated list foreign row `{handle, connected, writable}` only; owned row keeps preview/title/path. Inbox foreign row drops `subject`/`body`/`payload`.
+8. Owned `terminal read --terminal <own>` remains allow. Isolated owned read **spawned**.
+9. Owned `orchestration check` (no `--terminal`) remains allow. Isolated check/inbox pin-inject **spawned**.
+10. `action=cli` still returns `policyResult.rejection` before `runOrca` when `!policyResult.ok`. Isolated deny-show/auto/send-`@all`: spawned argv `[]`.
+11. `action=release` still runs `preflightReleaseOwnership` first. **Re-driven** this round (unit + isolated HTTP). Foreign dispatch/handle → `ownership_denied`, zero teardown `runJson`.
+12. `resolve*` still does not key on `runtimeId` (not re-broken; read).
+13. Forbidden handoff (`worktree create --agent --prompt`) still always denies.
+14. Named `--task` / `--run` / `--id` (non-`msg_*` on non-reply) / `--page` / `--parent-worktree` presence enters the resolver funnel; foreign/unknown denies on and off. **`--to @all` / `@worktree:` now deny. `--workspace` is not in this item.**
+15. Unscoped `run-list` and `worker-list` deny on and off. Isolated worker-list **not spawned**.
+16. Caller-facing *cli-policy* rejection has no `ownership_status` / `reason` / `owned_*` (audit fields stay on the local `onWarning` log). Isolated `@all` / foreign-show payloads confirmed. `action=release` denials *do* carry those fields (by design of `releaseOwnershipDenial`; not a cli-policy regression).
+17. `stop --worktree new-child` is not synthetic-owned.
+18. `terminal list --worktree <own>` and `worktree show --worktree <own>` allow.
+19. `action=cli orchestration inbox` injects `--terminal <pin>` and `--json`. Isolated: no `--json` on caller → spawned `inbox --terminal <pin> --json`; caller JSON has no `subject`/`body`/`payload` on unowned `from_handle` rows.
+20. `withSender` overwrites caller `--from` (isolated: `reply --from term_FOREIGN` spawned as `--from term_iso_pin`).
+21. Positional `automations show <id>` / `artifacts delete <id>` deny on and off and do not spawn.
+
+## Independent suite numbers
+
+```
+# tests 427
+# suites 86
+# pass 427
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 928.214241
+```
+
+Run at `a119214` via `npm test`. Matches the implementer's 419 → 427 claim. As in every previous round, 427/0 is not evidence that the inversion holds. MUT4b is green for the same reason MUT3 was green at `a2a715d`: the assertion is on the weaker object.
+
+## Named-ticket scorecard
+
+| Ticket | Named hole | At `a119214` |
+|--------|------------|--------------|
+| NAS-250 | `terminal show --json --terminal <foreign>` → `result.terminal.preview` | **Holds** on the JSON/`--terminal` surface. Isolated deny does not spawn. Isolated list redacts foreign preview/title/path. Unwalkable bodies withhold (Item 3 holds). |
+| NAS-251 | `terminal stop --worktree <foreign>` soft-exec under hardening off | **Holds** for flagged `--worktree` and for `--to @worktree:<sel>`. **Broken** for the documented `--workspace <sel>` automation address (P0-1). Not live-executed. |
+| NAS-252 | Ownership default-deny of **any** target selector, hardening-independent | **Broken.** `--workspace path:/foreign` (and `name:`/`branch:`/`id:`) is a documented target selector that never enters a resolver. Hardening off spawns. Differential lock does not know this name (MUT4b). |
+
+## What this review did not do
+
+- Did not exec `terminal stop`, `worker-release`, `worker-start`, `tab close`, `task-update`, `gate-resolve`, `orchestration reply` / `send --to @all` / `@worktree:`, `automations create|remove|run`, or `artifacts delete` against any foreign id on the shared runtime.
+- Did not flip `ORCA_BRIDGE_CLI_HARDENING`, restart the live bridge, or write `~/.orca-bridge/` / `~/.orca-bridge-sender-pins.json`. Isolated HOME copies only.
+- Did not re-test NAS-249 / NAS-253 bind oracles. `--from` overwrite was proven as a gate/spawn fact.
+- Did not fuzz every banner variant or `maxBuffer` ceiling on the live CLI.
+- Did not stand a second isolated bridge with `ORCA_BRIDGE_CLI_HARDENING=1` — allowlist deny of `automations create` under hardening on is a unit fact (`evaluateCliArgv`); the P0 is the hardening-off spawn, which is the default.
+
+## Attack surface actually covered
+
+Enumerated, not implied:
+
+- MUT1, MUT2, MUT3, MUT4a, MUT4b, MUT4c, MUT4c2 on the real files (restored; md5 match HEAD).
+- Snapshot-vs-live spec compare (228/228, 0 diffs) and `CLI_SPEC_VERSION` pin.
+- v1.4.180 flag census: every spec flag classified; 0 unclassified shipped flags; every selector-ish `NON_TARGET` name checked against live handlers (`workspace` → `getOptionalWorktreeSelector`; `selector` → CSS; `to-id`/`parent-id`/`reply-to`/`write-id` → Linear; `destination` → clone path; `environment` → global env name; `thread-id` → send thread; `path`/`file` → filesystem; `from` → admin, overwritten).
+- No sibling-matching heuristic: "content flag" = `NON_TARGET_FLAGS` membership. `to-id` / `to-x` / `to-y` cannot pull `--to` into content; `--to` is TARGET and applied last in `FLAG_TABLE`.
+- `evaluateCliArgv` tables (hard on and off) for the r9 catalogue plus `@ALL`/`@everyone`/`@worktree`/`@worktree:`/whitespace/`all`/`*`, `--ack` UUID/`ack_FOREIGN`/`delivery_FOREIGN`, `computer --id accessibility`/`task_FOREIGN`, content-token owned argv, `--to @worktree:path:/own`, `--workspace` forms, `file open path:`/`/abs`, `environment --environment path:`, `project setup-clone --destination path:`, `linear comment --reply-to`, `dispatch --to @all`, `ask --to @all`, `claude-teams --resume`, forbidden handoff, unscoped lists.
+- Item 3 withhold unit: human, truncated JSON, binary NUL, non-UTF8 `\uFFFD`, stderr `error: SECRET`, stderr JSON `{error:{message}}`, parseable `{preamble}`, inbox envelope, owned human, owned JSON, empty stdout, non-zero JSON, bare-string array, parseable non-envelope, stub `redactTerminalListHumanStdout`.
+- Isolated `action=cli` spawn + caller SSE payload: inbox (no json / `--full` / `--json`), automations show deny, reply `--from` overwrite, terminal list redaction, linear issue, worktree list `--repo`, owned read, foreign show deny, send `--to` foreign/`@all`/`@worktree:foreign`, automations create `--workspace path:`/`name:`, file open `path:`/`/abs`, computer `--id` both forms, owned reply/send, unscoped worker-list deny, `--ack` UUID, human-mode list withhold.
+- Isolated `action=release` foreign dispatch + foreign handle (HELD 11).
+- Unit `executeReleaseWorker` foreign dispatch/handle/missing (zero effects).
+- Independent 427/0 suite.
+
+## Follow-up if this is closed (not this review)
+
+The merge-blocking fix is small and in the existing tables, not a redesign:
+
+1. Move `workspace` from `NON_TARGET_FLAGS` to `TARGET_FLAG_RESOLVERS` as `'worktree'` (or collect it in the name-based worktree branch the way `--worktree` is collected). Linear `--workspace` is a UUID / non-orch value — the Item 5 `--id` pattern (ignore `classifyValueOwnershipKind == null`) keeps those as non-targets.
+2. Add `workspace` to `TARGET_CAPABLE` so MUT4b-shaped demotion fails.
+3. Effect-lock `automations create --workspace path:/foreign` → deny, and `file open path:/foreign` → deny (restore the r9 fact).
+4. Optional P2: `--ack` UUID, `--json=false`, wire the `resolvers` map or delete it, owned-human withhold docs.
+
+Until (1) lands, NAS-251/252 are not closed. Do not merge.
