@@ -110,6 +110,7 @@ import {
   writeFilePreservingOwner,
   resolveTerminalHandleOwnership,
   resolveDispatchOwnership,
+  resolveWorktreeOwnership,
   listOwnedTerminalHandles,
   applyOwnershipListRedaction,
 } from './lib/state-ownership.mjs';
@@ -190,6 +191,14 @@ const CLI_POLICY = createCliPolicy({
   ),
   dispatchOwnershipCheck: (ctx) => resolveDispatchOwnership(
     ctx.dispatchId,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+    },
+  ),
+  worktreeOwnershipCheck: (ctx) => resolveWorktreeOwnership(
+    ctx.worktree,
     currentClientKey(),
     {
       dispatchRegistry,
@@ -712,9 +721,9 @@ function argvWantsJson(args) {
 
 
 /**
- * NAS-248: strip foreign PTY preview/scrollback from action=cli responses.
- * Keys on RESPONSE SHAPE (terminal/worktree rows with preview content), not
- * argv position. Mutates `described` in place for envelope and/or stdout.
+ * NAS-248/250: strip foreign PTY content from action=cli responses.
+ * Recursive content-key redaction (preview/scrollback/…) on any node whose
+ * terminal handle is not proven owned. Mutates `described` in place.
  * Never call from runJson internals (resolveSenderTerminal needs full inventory).
  *
  * @param {object} described
