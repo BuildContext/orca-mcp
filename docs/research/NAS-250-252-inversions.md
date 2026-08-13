@@ -562,3 +562,300 @@ Unit-pinned via existing NAS-250/251/252 tables + new NAS-252 real-inversion sui
 8. **Human stdout redaction** for non-preview secret classes (raw `terminal read` tails without `preview:` lines) remains best-effort; foreign read is denied at the gate first.
 9. **Effect tests do not start an in-process HTTP bridge.** They prove `evaluateCliArgv` returns deny before spawn (server short-circuit at `!policyResult.ok` still present — read, not integration-harnessed this round).
 
+---
+
+# Adversarial review of `6c97af0` — try to break the real inversions
+
+**Reviewer:** dispatched attack worker (NAS-252 review r7, fresh eyes)  
+**Target:** `BuildContext/nas-248-ownership-invariant` @ `6c97af0`  
+**Worktree:** `/home/orca/orca/workspaces/orca-mcp/nas-252-review-r7` (reset onto the target; this review only appends this section)  
+**CLI oracle:** live AppImage v1.4.180 (`/tmp/nas-248-cli/squashfs-root/.../out/cli`) plus live `orca` against runtime v1.4.180  
+**Date:** 2026-08-13  
+**Production code changed by this review:** no  
+**Bridge process touched:** no  
+**`ORCA_BRIDGE_CLI_HARDENING` on the live bridge:** not flipped  
+**Destructive live `stop` / `release` / `close` / `worker-start` / `tab close` / `task-update` / `gate-resolve` / `reply` / `automations remove|run` / `artifacts delete`:** not executed (NAS-202 boundary). Those shapes are argv-proof only.
+
+This review treats every implementer claim at `6c97af0` as a hypothesis. A green suite is not evidence. Six prior rounds in this lineage each shipped live P0s behind 321 / 346 / 353 / 353 / 388 / 406.
+
+## VERDICT
+
+**BREAKABLE. Do not merge to main.**
+
+The FLAG_TABLE / per-kind resolver work at `6c97af0` does close the *named-flag* holes from the previous review: `dispatch-show --task`, `task-list --run`, `run-show --id`, `run-list` unscoped, `--page`, `--parent-worktree`, `--repo`, the P1-2 null-handle false deny, the deny-path oracle, and synthetic `stop --worktree new-child` all deny on the collected `--flag` surface, hardening on and off. Those named reproductions are genuinely dead, not just rewritten.
+
+The inversion that was supposed to make ownership an invariant is still not implemented. Both new mechanisms are allowlists over **named flags and named JSON keys**. The shipped v1.4.180 CLI names many of the same targets **positionally**; `normalizeCommandPositionals` promotes those tokens to flags *after* the bridge gate, so `FLAG_TABLE` never sees them. Independently, P0-3 is not fixed on the production spawn path: `injectSenderArgv` gained an inbox pin, but `withSender` in `server.mjs` still only injects for `check`. Combined with `describeRun` putting human stdout on the redaction path that no-ops unless the text contains `preview`/`scrollback`/`buffer`, `orchestration inbox --full` (no `--json`) still dumps the host-wide mailbox. Live v1.4.180 printed that shape on this host (subjects + `[payload]` marker, no `preview` word). NAS-252 is not closed.
+
+## Method
+
+- Diffed `3e4e6da..6c97af0`. Read `lib/cli-policy.mjs` (`FLAG_TABLE`, `evaluateCliArgv`, `ownershipDecision`), `lib/state-ownership.mjs` (`INVENTORY_ALLOWLIST_KEYS`, `redactOwnershipContent`, `resolveGenericIdOwnership`), `lib/security-core.mjs` (`injectSenderArgv`), `server.mjs` (`withSender` at 1276, `action=cli` at 2529–2555, `applyCliOwnershipRedaction`, `describeRun`).
+- Enumerated positionalArgs + usage `--flags` from live v1.4.180 specs under `/tmp/nas-248-cli/squashfs-root/resources/app.asar.unpacked/out/cli/specs/`. Cross-checked `args.js` `normalizeCommandPositionals` / `parseArgs` and `handlers/{file,orchestration,automations}.js`.
+- Independent `npm test` at `6c97af0`: **406 pass / 0 fail / 0 skipped**.
+- `/tmp/nas-252-r7-attack-probe.mjs` imports branch modules only. Full transcript: `/tmp/nas-252-r7-probe-out.txt`.
+- Live read-only `orca` (host identity, shape + effect oracle): `orchestration inbox --json/--limit`, `inbox` human, `inbox --full` human, `automations list --json`, `terminal list` human, `worker-list --json`. Bodies / payloads / titles were measured by length and then discarded; they are not reproduced here.
+
+## Prior-reproduction scorecard (re-run against `6c97af0`, not trusted from the fix summary)
+
+| Prior finding | `evaluateCliArgv` @ 6c97af0 (hard off / on) | Genuinely dead? |
+|---------------|---------------------------------------------|-----------------|
+| P0-1 `dispatch-show --task FOREIGN [--preamble]` | deny / deny, `handle_not_owned`, no oracle fields | **Dead** on the `--task` flag |
+| P0-2 `task-list --run FOREIGN` | deny / deny | **Dead** on the `--run` flag |
+| P0-2 `run-show --id FOREIGN` | deny / deny | **Dead** on the `--id` flag |
+| P0-2 `run-list` unscoped | deny / deny, `unscoped_run_list` | **Dead** |
+| P0-2 `worker-list --run FOREIGN` | deny / deny | **Dead** on the `--run` flag |
+| P0-2 `worker-list` *unscoped* | **allow_with_warning** / allowlist deny | **Still live** under hardening off (see P1-5) |
+| P0-3 `inbox --json` no `--terminal` | **allow_with_warning** / allowlist deny | **Still live** — pin is not injected at spawn |
+| P0-3 `inbox --full` no `--json` | **allow_with_warning** / allowlist deny | **Still live**, and redaction is a no-op |
+| `check --run FOREIGN` | deny / deny | Dead (new; was allow at bb755f5) |
+| `--page` / `--parent-worktree` / `--repo` | deny / deny | Dead on those flags |
+| P1-2 `terminal list --worktree OWN` / `worktree show --worktree OWN` | allow / allow | **Fixed** |
+| P1-2 `file open PATH --worktree OWN` | allow_with_warning / allowlist deny | Ownership false-deny is **fixed**; still not on `RAW_CLI_OK` |
+| P1-3 deny oracle + `owned_*` | uniform `handle_not_owned`; ghost === foreign detail; no `ownership_status` / `reason` / `owned_*` | **Dead** |
+| P1-4 JSON `title` / `worktreePath` | stripped on non-owned JSON nodes | **Dead on JSON**; **live on human stdout** |
+| P2-2 `stop --worktree new-child` | deny | **Dead** |
+| P2-3 worktree `name:` / `id:repo::path` / `branch:` / `issue:` | deny (fail-closed) | **HELD** |
+
+"Looks dead" vs "is dead": the `--json` inbox path would have inventory-redacted bodies *if it spawned*. It still spawns, unscoped, because `withSender` never adds `--terminal`. Omitting `--json` makes even that defense disappear.
+
+## Findings (ranked)
+
+### P0-1 — `orchestration inbox` is still host-wide; the pin was wired in a helper the spawn path does not call
+
+Author claim E: "`injectSenderArgv` now injects `--terminal <pin>` for **both** `check` and `inbox`."
+
+That sentence is true of `lib/security-core.mjs` and of `lib/security-core.test.mjs`. It is false of the production caller.
+
+```js
+// server.mjs:1276
+async function withSender(argv) {
+  if (argv[0] !== 'orchestration') return argv;
+  const sub = argv[1];
+  const needsFrom = ORCH_FROM_CMDS.has(sub);
+  const needsTerminal = sub === 'check';   // inbox is not here
+  if (!needsFrom && !needsTerminal) return argv;
+  const sender = await resolveSenderTerminal();
+  return injectSenderArgv(argv, sender.handle);
+}
+```
+
+`action=cli` (`server.mjs:2533–2539`) evaluates policy on the raw argv, then calls `withSender`. Inbox has no target flag, is not on `RAW_CLI_OK_PREFIXES`, and is explicitly skipped by the null-handle fail-closed (`isOrchInbox`). Hardening off (the live posture) → `allow_with_warning` → `runOrca(['orchestration','inbox',…])` as the host identity. The live handler (`handlers/orchestration.js:522`) passes `terminal: undefined` and the runtime returns the host-wide mailbox. The CLI's own help text still says "Show all messages across recipients."
+
+`injectSenderArgv(['orchestration','inbox','--json'], 'term_own')` does append `--terminal term_own`. The unit test asserts that. `withSender` never reaches it.
+
+Defense-in-depth also fails on the path an attacker would actually use. `describeRun` only attaches `envelope` when `argvWantsJson` is true. Without `--json`, the described object is `{ stdout: <human text> }`. `applyOwnershipListRedaction` then:
+
+1. skips the envelope walk (none present);
+2. tries to `JSON.parse` the human mailbox dump, fails;
+3. only runs the human rewriter if the text matches `/preview|scrollback|buffer/i`.
+
+Live `orca orchestration inbox --limit 3` on this host: 301 bytes, lines start `msg_…`, **no** `preview` word. Live `inbox --full --limit 2`: 379 bytes, **`[payload]` marker present**, still no `preview` word. The walker is a no-op. Default human inbox prints `id from -> to: "subject"`. `--full` appends body and `[payload] …`.
+
+JSON `--json` inbox *would* strip `subject`/`body`/`payload` on rows whose first resolvable handle (`from_handle`) is not owned. That is not the spawn path that matters, and even that JSON walk keeps host-wide `id` / `from_handle` / `to_handle` / `run_id` inventory.
+
+This is the previous P0-3, still live. The suite is green because the test covers the helper, not `withSender`.
+
+### P0-2 — FLAG_TABLE is an allowlist over flags; v1.4.180 names the same targets positionally
+
+Source of truth: shipped specs' `positionalArgs` + `normalizeCommandPositionals` in `args.js`. After a base-path match, leftover command-path tokens are copied onto flags **inside the CLI**, after the bridge has already decided.
+
+Documented positionals that map onto a `TARGET` resolver name (`id`) or onto a path that names a foreign object:
+
+| argv the CLI documents | flags `collectFlagNamesFromArgv` sees | hard off | hard on |
+|------------------------|----------------------------------------|----------|---------|
+| `automations show <id>` | `[]` | **allow_with_warning** | allowlist deny |
+| `automations show --id <id>` | `['id']` | **deny** `handle_not_owned` | deny |
+| `automations edit/remove/run <id>` | `[]` (plus `--name` on edit) | **allow_with_warning** | allowlist deny |
+| `artifacts delete <id>` | `[]` | **allow_with_warning** | allowlist deny |
+| `artifacts delete --id <id>` | `['id']` | **deny** | deny |
+| `linear issue <id>` | `['json']` | **allow_with_warning** | allowlist deny |
+| `file open <path>` (no `--worktree`) | `[]` | **allow_with_warning** | allowlist deny |
+| `file open --path <path>` | `['path']` (`path` is `non_target`) | **allow_with_warning** | allowlist deny |
+
+The same command, same id, two spellings, opposite ownership verdicts. `FLAG_TABLE` never sees `argv[n]`. Hardening is load-bearing. NAS-252's entire point was that it must not be.
+
+`formatAutomationShow` prints `prompt: ${automation.prompt}`. Human `automations show <id>` has no `preview` word, so redaction would not run. This host currently has **0** automations (`automations list --json` → `n=0`), so there is no live prompt to steal today; the shape is argv-proven against the shipped spec and handler. `automations remove|run <id>` and `artifacts delete <id>` are destructive — not live-executed; the gate will not save us.
+
+Related misses that are *not* a live teardown because the CLI rejects extra tokens (no `positionalArgs` on those specs), but that the gate also does not see:
+
+- `worktree rm <selector>` — not a spec form (`--worktree` is required). Under `admin:true` the prefix `worktree rm` is allowlisted and a positional selector is invisible; live CLI validation should fail closed. Argv-proof of gate-blindness only.
+- `orchestration reply <msg_id> --body x` — allow (reply is on `RAW_CLI_OK`); CLI should reject the extra token. The `--id` form is a different hole (P1-3).
+- `terminal show <handle>` — fail-closed by the legacy null-handle gate. Good.
+
+`--path` is classified `non_target`. An absolute path that names another checkout is not a selector as far as the gate is concerned. `file open` still infers worktree from cwd when `--worktree` is omitted; runtime may reject paths outside that worktree. Not claimed as a clean foreign-file read without a runtime check. The positional *id* split above is the clean bypass.
+
+### P1-1 — Human stdout / stderr never reach the inventory walker
+
+`applyOwnershipListRedaction` walks `described.envelope` and, if present, `described.stdout`. It does not walk `stderr` or `stderrTail`. Human `terminal list` (allowlisted, commonly used without `--json`) formats:
+
+```
+${handle}  ${title}  connected  ${worktreePath}
+preview: ${preview}
+```
+
+The rewriter fires (the text contains `preview:`) and strips preview lines. **Titles and `worktreePath` remain.** Live `orca terminal list` on this host: 13 `term_` rows, 9650 bytes, `~/` paths in the first line. P1-4 is JSON-only.
+
+Same class: any allowed/soft-exec command whose human formatter prints `subject`, `prompt`, `spec`, `objective`, or `[payload]` and whose text lacks `preview`/`scrollback`/`buffer` is unredacted. Inbox `--full` is the P0 instance. Automation show is the empty-host instance.
+
+`error` objects keep `message` (and `code`) because `error` is allowlisted and the walker recurses into allowlisted keys with `parentOwned=false`, then keeps allowlisted children — and `message` is not stripped (it is not in `NON_OWNED_STRIP_EXTRA`; wait: `message` is an inventory key). Probe: `{ error: { message: SECRET, code: 'x', stack: SECRET } }` → `stack` gone, **`message` kept**.
+
+Bare-string arrays under allowlisted keys survive: `{ messages: [SECRET, 'also-secret'] }` is unchanged. Live inbox messages are objects, so this is a shape risk, not a live envelope.
+
+`name` / `source` / `agent` / `branch` on a node with no handle are kept as strings. Live terminal-list `branch` after JSON redaction is still present on foreign rows (`feat/secret` in the unit probe). Branch names on this host are attacker-relevant recon (other coordinators' feature branches). P2 as content, listed here because it is the allowlist-string cousin of the human-stdout miss.
+
+### P1-2 — Admin-exempt `--to` / `--from` and other object-naming flags that FLAG_TABLE calls `non_target`
+
+`--to` / `--from` are `ADMIN_SELECTOR_FLAGS`. Their *values* name handles, `run:id`, and `dispatch:id`. The gate does not run a resolver on the value.
+
+```
+orchestration send --to dispatch:ctx_FOREIGN --subject x --json
+orchestration send --to run:run_FOREIGN --subject x
+orchestration send --to term_FOREIGN --subject x
+orchestration reply --id msg_FOREIGN --body x --from term_FOREIGN --json
+```
+
+All four: `decision=allow` with hardening **on and off** (send/reply are on the admin / default allow surface respectively).
+
+`withSender` / `injectSenderArgv` do **not** overwrite a caller-supplied `--from`:
+
+```
+injectSenderArgv(['orchestration','reply','--id','msg_FOREIGN','--body','x','--from', FOREIGN], OWN)
+→ ['orchestration','reply','--id','msg_FOREIGN','--body','x','--from', FOREIGN]
+```
+
+Author open item 3 says "the runtime + injected `--from` pin remain the real mailbox boundary." The pin is optional. Combined with `resolveGenericIdOwnership` treating every `msg_*` as `owned` / `message_id_runtime_scoped`, the bridge will spawn `reply --id msg_FOREIGN --from term_FOREIGN`. Not live-executed. Whether the runtime honors a spoofed `--from` is NAS-249-adjacent; the bridge gate does not enforce the pin it claims is the boundary.
+
+Other object-naming flags classified `non_target` (hardening-off `allow` / `allow_with_warning`; `--ack` even allows under hardening because `check` is on `RAW_CLI_OK`):
+
+| flag | names | argv-proof decision (hard off) |
+|------|-------|--------------------------------|
+| `--ack` | delivery id | `check --ack delivery_FOREIGN` → **allow** |
+| `--retry-of` | dispatch id | `worker-start --task OWN --retry-of FOREIGN` → **allow** |
+| `--resume` | message id | `ask --resume msg_FOREIGN` → allow_with_warning |
+| `--parent` | task id | `task-create --spec x --parent task_FOREIGN` → **allow** |
+
+`--ack` of a foreign delivery is a consume/steal. Not live-executed.
+
+Compound `--worktree name:…` / `id:repo::path` / `branch:` / `issue:` still fail closed. No NAS-251 bypass via the value grammar.
+
+### P1-3 — `msg_*` is a blanket own; author's "runtime-scoped" note hides a gate hole
+
+```js
+if (n.startsWith('msg_')) {
+  return pack(HANDLE_OWNED, 'message_id_runtime_scoped', { kind_hint: 'message' });
+}
+```
+
+`orchestration reply --id msg_FOREIGN --body x --json` → `allow` hardening on **and** off. This is intentional in the author's text. It is not correctly scoped: the compensating control (forced `--from` pin) is not actually forced (P1-2). Judge: **hiding a live effect**, not a paperwork deferral.
+
+### P1-4 — Unscoped `worker-list` still soft-execs (the run-list fix was not applied to the sibling)
+
+`run-list` without `--run`/`--id` is specially denied. `worker-list` without `--run` is not.
+
+```
+evaluateCliArgv(['orchestration','worker-list','--json']) → allow_with_warning (hard off)
+```
+
+Live `orca orchestration worker-list --json` on this host: **17** rows. Keys: `agentTerminalHandle`, `dispatchId`, `dispatchStatus`, `resource`, `runId`, `taskId`, `terminalState`, `workerState`. No spec/preamble (so JSON inventory redaction would drop some fields — `agentTerminalHandle` is not even a recognised handle key). What remains after a JSON walk is still every `dispatchId` / `runId` / `taskId` on the host. Human worker-list, if used, skips the walker.
+
+Same class, weaker: unscoped `task-list` is `allow_with_warning`, but the CLI scopes it via `callerTerminalHandle` when `--run` is omitted, and `task-list` is in `ORCH_FROM_CMDS` so `withSender` *does* inject `--from`. Not claimed as a host-wide spec dump.
+
+### P1-5 — `worktree list --repo` / `repo show --repo` / `computer permissions --id` are false denies of documented forms
+
+Page/repo have no registry. The author declared that. The effect is that the **documented** `orca worktree list [--repo <selector>]` form is unconditionally `handle_not_owned` whenever `--repo` is present, including `--repo` of a repo this client actually uses. `worktree list` without `--repo` still allows (and is the form coordinators need).
+
+`computer permissions --id accessibility` is a documented Computer Use flag. `--id` is a target resolver. `accessibility` is not a `task_`/`run_`/`msg_`/`ctx_` id → deny. False deny, P2-ish as coordinator impact (computer-use via the bridge) — listed here because it is the same `--id` overload that made positional `automations show` a bypass.
+
+`cookie set --httpOnly` / `--sameSite`: v1.4.180 `allowedFlags` includes `httpOnly` and `sameSite`. `FLAG_TABLE` does not (`missing_in_table: ["httponly","samesite"]`). Unclassified → deny. False deny, not a bypass. The claim "every long-flag the shipped CLI accepts is classified" is false.
+
+## Author claims that are inaccurate
+
+| Claim at `6c97af0` | Reality |
+|--------------------|---------|
+| "Every long-flag on argv is classified. Unclassified → DENY." | True for `--` flags that `collectFlagNamesFromArgv` sees. False as a description of the CLI: positionals never become flags at the gate. Also false for `--httpOnly` / `--sameSite`. |
+| "listed-but-unwired is impossible by construction via a test" | True inside `TARGET_FLAG_RESOLVERS` ↔ `FLAG_TABLE`. The test does not know about `positionalArgs`. |
+| "inbox pin inject + inventory redaction" (P0-3 **Fixed**) | `injectSenderArgv` is fixed. `withSender` is not. Human/`--full` inbox never reaches the walker. Live host still serves the unscoped mailbox. |
+| "Redaction is now an inventory ALLOWLIST… kills preamble, spec, objective, payload and title at once" | True for JSON nodes whose first handle-shaped key is unowned. False for human stdout, `stderr`/`stderrTail`, allowlisted string fields (`name`, `source`, `error.message`, `branch`), and bare-string arrays under allowlisted keys. |
+| "inbox scoped via pin injection" | Skip-handle-gate is true. Pin injection at spawn is **false**. |
+| "The runtime + injected `--from` pin remain the real mailbox boundary" for `msg_*` | `--from` is not injected when the caller already supplied one, and is not ownership-checked. |
+| "run-list is hard-denied unscoped" (implied: the host-wide list class is closed) | `run-list` is. `worker-list` is not. 17 live rows on this host. |
+| Suite **406 / 0** | **Accurate.** Independent rerun below. |
+
+## Regressions that break legitimate coordinator use (not bypasses)
+
+These are ship-relevant even when they are fail-closed.
+
+1. **`worktree list --repo <selector>`** — documented form, now always denied (no `ownedRepos` on the live server). Coordinators should use `worktree list` without `--repo`; that form still allows. Still a false deny of a shipped usage string.
+2. **`cookie set --httpOnly` / `--sameSite`** — shipped flags, now unclassified deny.
+3. **`computer permissions --id accessibility`** — shipped flag, now ownership-denied.
+4. **`orchestration check --run <id>`** — now ownership-gated. Foreign deny is correct. An owned run the bridge never registered is a false deny; coordinators can omit `--run` (pin-scoped mailbox still allows). Not observed as a live coordinator break in this session.
+5. **Unscoped `run-list` deny** — conservative and justified. Coordinators bind a run via dispatch/await and do not need the host-wide catalogue. **Not a ship-blocker.** `run-list --run OWN` is `allow_with_warning` under hardening off (then allowlist-denied under hardening, same as other non-`RAW_CLI_OK` orch reads).
+6. **Human `action=cli orchestration check` would redact incoming bodies** if anyone used that path: `from_handle` is the first handle key, so worker→coordinator messages look unowned and lose `body`/`payload`. Coordinators use `action=check` / `action=await`, which do **not** call `applyCliOwnershipRedaction`. Not a live coordinator break today; a trap if check is ever moved onto `action=cli`.
+
+P1-2 (`terminal list --worktree`, `worktree show --worktree`) is **fixed** and was re-tested allow/allow.
+
+## HELD — still hold, must not regress
+
+Re-probed at `6c97af0`. Keep all 13 from the previous review:
+
+1. `terminal show --json --terminal <foreign>` (space, `=`, leading/interleaved `--json`, `TERMINAL SHOW`) → deny, `handle_not_owned`, hardening on and off.
+2. Same for `terminal read` / `close` / `send` / `wait` / `switch` / `rename` / `split` with foreign `--terminal`. Positional `terminal show <handle>` also fail-closes (null handle).
+3. `terminal stop --worktree <foreign>` and `path:<foreign>` / `name:` / `id:repo::path` / `branch:` / `issue:` → deny, on and off. Not a bypass.
+4. Duplicate `--terminal` / `--worktree` deny-any.
+5. Interleaved `orchestration --json worker-read --dispatch FOREIGN` still enters the dispatch checker.
+6. Missing checker + present collected selector → deny (never soft-exec).
+7. JSON `applyOwnershipListRedaction` on list/show shapes strips `preview`; non-owned JSON rows also drop `title` / `worktreePath`. (Human list titles are **not** in this HELD item — see P1-1.)
+8. Owned `terminal read --terminal <own>` and owned `worker-read --dispatch <own>` remain allow, on and off.
+9. Owned `orchestration check` (no `--terminal`) remains allow.
+10. `action=cli` still returns `policyResult.rejection` before `runOrca` when `!policyResult.ok` (`server.mjs:2533–2536`).
+11. `action=release` still runs `preflightReleaseOwnership` first. Not re-broken.
+12. `resolve*` still does not key on `runtimeId`.
+13. Forbidden handoff (`worktree create --agent --prompt`) still always denies.
+
+Plus, newly holding and required:
+
+14. Named `--task` / `--run` / `--id` (non-`msg_*`) / `--page` / `--parent-worktree` / `--repo` presence enters the resolver funnel; foreign/unknown denies on and off.
+15. Unscoped `run-list` denies on and off.
+16. Caller-facing ownership rejection has no `ownership_status` / `reason` / `owned_*`.
+17. `stop --worktree new-child` is not synthetic-owned.
+18. `terminal list --worktree <own>` and `worktree show --worktree <own>` allow (P1-2).
+
+## Author open items — scoped or hiding?
+
+| # | Author note | Judge |
+|---|-------------|-------|
+| 1 | No live foreign re-probe | **Correctly scoped** for destructive exec. **Hides the P0**: they also did not re-read `withSender`, which is the only spawn-path caller. A helper unit test is not a live path. |
+| 2 | Page/repo fail-closed without registry | **Correctly scoped as fail-closed**, and **hides a live documented false deny** (`worktree list --repo`). Intentional, but it is an effect, not just a footnote. |
+| 3 | `msg_*` runtime-scoped via injected `--from` | **Hiding a live effect.** Blanket `owned` + skippable `--from` is a gate hole, not a runtime-only concern. |
+
+## Independent suite numbers
+
+```
+# tests 406
+# suites 83
+# pass 406
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 1370.751388
+```
+
+Run at `6c97af0` in `/home/orca/orca/workspaces/orca-mcp/nas-252-review-r7` via `npm test`. Matches the implementer's 388 → 406 claim. As in every previous round, 406/0 is not evidence that the inversion holds. The inbox pin test is green because it asserts on `injectSenderArgv`, not on `withSender`.
+
+## Named-ticket scorecard
+
+| Ticket | Named hole | At `6c97af0` |
+|--------|------------|--------------|
+| NAS-250 | `terminal show --json --terminal <foreign>` → `result.terminal.preview` | **Holds** on the JSON/`--terminal` surface. Human `terminal list` still prints foreign titles/paths. |
+| NAS-251 | `terminal stop --worktree <foreign>` soft-exec under hardening off | **Holds** for flagged selectors. Path-alias fail-closed. Not live-executed. |
+| NAS-252 | Ownership default-deny of **any** target selector, hardening-independent | **Broken.** Positionals that the CLI promotes to `--id`/`--path` never enter the funnel. Inbox spawn is still hardening-dependent (`allow_with_warning`). Unscoped `worker-list` is still hardening-dependent. `--to`/`--from`/`--ack`/`--retry-of`/`--parent` name objects and are classified non-target/admin. |
+
+## What this review did not do
+
+- Did not exec `terminal stop`, `worker-release`, `worker-start`, `tab close`, `task-update`, `gate-resolve`, `orchestration reply`, `automations remove|run`, or `artifacts delete` against any foreign id.
+- Did not flip `ORCA_BRIDGE_CLI_HARDENING`, restart the bridge, or write `~/.orca-bridge/` / `~/.orca-bridge-sender-pins.json`.
+- Did not stand up an isolated HOME bridge.
+- Did not re-test NAS-249 / NAS-253 bind oracles. The `--from` overwrite miss is reported as a gate fact, not as a bind-oracle result.
+
+Probe script: `/tmp/nas-252-r7-attack-probe.mjs`. Live key dumps (no bodies): `/tmp/nas-252-r7-live/`.
+
