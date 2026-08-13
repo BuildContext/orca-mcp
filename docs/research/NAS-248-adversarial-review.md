@@ -399,3 +399,330 @@ Hardening remains the **allowlist** migration knob only. Default is still off (`
 | `lib/cli-policy.test.mjs` | soft→deny expectations; interleaved P1 table |
 | `server.mjs` | thin release wrapper; shape redaction; `argvWantsJson` |
 | this doc | append-only findings |
+
+---
+
+## Second adversarial review — 2026-08-13 (verification of the bypass-fix)
+
+**Reviewer:** dispatched attack worker, fresh (did not write `69b1c9f` or `367ebb6`)  
+**Target:** `BuildContext/nas-248-ownership-invariant` @ `367ebb6`  
+**Worktree:** `/home/orca/orca/workspaces/orca-mcp/nas-248-attack-review-2` (detached at the target commit; sibling worktree already holds the branch name)  
+**CLI oracle:** live AppImage v1.4.180 `parseArgs` / `BOOLEAN_FLAGS` / `printResult` / `formatTerminalShow` (`/tmp/nas-248-cli/squashfs-root/.../out/cli`)  
+**Independent suite:** **346 pass / 0 fail / 0 skipped** (`npm test` on this commit)  
+**Production code changed by this review:** no  
+**Bridge process touched:** no  
+**Destructive live `release` / `close` / `worker-release` / `worker-stop` / `terminal stop` / `worktree rm`:** not executed (NAS-202 boundary)  
+**Read-only live probes:** `terminal list --json` (keys only), `terminal show --json` of *this worker's own* handle (keys only), `worktree list --json` (keys only)
+
+Treat the fix-author claims as hypotheses. Deliverable is attack shapes and results, not "the description matches the code."
+
+Probe JSON: `/tmp/nas-248-r2-probe.json`  
+Probe script: `/tmp/nas-248-r2-probe.mjs`
+
+### Verdict
+
+**Still breakable.** The two named P0 reproductions from the first review are genuinely dead. Ownership is still not a system invariant. Two new P0s are live on this commit under the actual ship posture (`ORCA_BRIDGE_CLI_HARDENING` unset / off):
+
+1. **`action=cli terminal show --json --terminal <foreign>` returns foreign `preview`.** Policy is `allow_with_warning` with hardening off (`looksLikeOwnershipGatedArgv` is false — only `read|close|send` are handle-gated). `applyOwnershipListRedaction` keys on `terminals[]`, so `result.terminal.preview` is not a recognized shape. Live v1.4.180 `printResult` pretty-prints `{ result: { terminal: { preview, … } } }`; own-handle probe: `preview` present, 300 chars, `result.terminals` absent. This is the NAS-218/170 class the ticket was split out to kill, via the command the first review listed as "not allowlisted" and the fix never gated.
+2. **`action=await` with an empty `clientOwnership.dispatches` set fail-opens the mailbox, then `dispatchRegistry.upsert(..., { clientKey: attacker })` overwrites the victim row. `requireOwnedDispatch` then returns `owned`.** In-process: bob's `disp_bob` becomes alice-owned; a subsequent `action=release` would pass the new preflight and call `worker-release`. This is the NAS-202 actor-shaped path, one hop past the gate the fix just wired. The deferred F5 ("orphan read") was the read side of the same `clientKey` model; the write-up was not assessed.
+
+A green suite at 346/0 does not cover either shape.
+
+---
+
+### Priority 1 — original P0 reproductions
+
+#### P0 #1 (`action=release` worker-release before the gate) — **DEAD**
+
+`server.mjs` `releaseWorker` is a thin wrapper: `ensureRuntimeReady` then `executeReleaseWorker`. No `runJson` in the wrapper. `preflightReleaseOwnership` runs before lookup / `worker-release` / close.
+
+In-process (`executeReleaseWorker` + recording `runJson`):
+
+| Shape | Result |
+|-------|--------|
+| `{ dispatch_id: FOREIGN }` | `ownership_denied`, **0** `runJson` calls |
+| `{ terminal_handle: FOREIGN }` | `ownership_denied`, **0** calls |
+| owned dispatch + foreign handle | preflight `ok:false kind=handle` |
+| whitespace-only dispatch, no handle | treated as missing, denied |
+| missing both ids | denied |
+| unknown after wiped maps | denied, 0 calls |
+| owned dispatch | `mode=worker-release`, one `worker-release --dispatch OWN` call |
+
+No production caller of `executeReleaseWorker` except `releaseWorker`. No leftover `terminal close` in `server.mjs` that skips the preflight. Error/fallback after a failed worker-release re-runs `preflightCloseHandle` before close. The gate does not throw-and-continue; it returns a denial envelope.
+
+`requireOwnedDispatch` is wired. The first review's "exported and never imported by `server.mjs`" claim is no longer true.
+
+Not executed against any live foreign dispatch.
+
+#### P0 #2 (`terminal list` preview leak via argv spelling) — **DEAD for list; sibling command is not**
+
+Live v1.4.180 still ships `preview` on every list row (16/16 nonempty; keys only logged). `printResult` is `JSON.stringify(response, null, 2)` — pretty-printed, starts with `{`, no banner on this runtime. `worktree list --json` still has **no** `preview` key.
+
+`applyOwnershipListRedaction` does not inspect argv. Combined with `argvWantsJson` (`--json` / `--json=*`) and `describeRun` parsing the whole pretty blob as the envelope, every list spelling the live `parseArgs` actually honours is redacted:
+
+| argv | CLI `flags.has('json')` | Bridge `argvWantsJson` | Foreign preview after redaction |
+|------|-------------------------|------------------------|----------------------------------|
+| `terminal list` | no | no | **omitted** (human `preview:` → `<redacted>`) |
+| `terminal list --json` | yes | yes | **omitted** |
+| `terminal list --json=true` | yes (`json="true"`) | yes | **omitted** |
+| `terminal list --json=` | yes (`json=""`) | yes | **omitted** |
+| `terminal list --json=false` | yes (`json="false"`; boolean flag is presence) | yes | **omitted** |
+| `terminal list --json=0` | yes | yes | **omitted** |
+| `--json terminal list` | yes | yes | **omitted** |
+| `terminal --json list` | yes | yes | **omitted** |
+| `terminal list --json --json` | yes | yes | **omitted** |
+| `terminal list --json --include-visual-layouts` | yes | yes | **omitted** |
+| `terminal list --limit 20 --json` | yes | yes | **omitted** |
+| `terminal list --worktree path:/x --json` | yes | yes | **omitted** |
+| `terminal list --json true` | yes (boolean does not consume `true`) | yes | **omitted** |
+| `TERMINAL LIST --json` | yes | yes | **omitted** (CLI `commandPath` is case-sensitive and would reject; redaction still holds) |
+| `terminal list --JSON` | **no** | **no** | n/a — live CLI unknown flag |
+| `-j terminal list` | **no** | **no** | n/a — no short flag in `parseArgs` |
+
+`parseArgs` has no `--` terminator, no `-j`, no case-fold on flag names. `BOOLEAN_FLAGS` includes `json`. No sixth *list* spelling. The first review's five leak spellings are closed.
+
+The sixth shape is not a list spelling. It is `terminal show`. See N1 below.
+
+Latent (not live on this CLI, no banner): banner + pretty JSON makes `findEnvelopeBody` miss (`whole` does not start with `{`) and `JSON.parse(trimmed stdout)` fail; human redaction looks for lines starting `preview:` and `term_…` headers, so `"preview": "SECRET"` survives. Compact-JSON-after-banner is parsed (line starting `{`). Recorded as P1 latent, not a live P0.
+
+---
+
+### Priority 2 — attack the new abstraction
+
+| Attack | Result |
+|--------|--------|
+| Call `executeReleaseWorker` without going through `preflightReleaseOwnership` | Not possible. The function itself is the only production path and calls preflight first. |
+| `server.mjs` close / worker-release leftover | None. Wrapper is as claimed. |
+| Effect after gate threw / returned undefined | Gate returns `{ok:false}`; wrapper returns `releaseOwnershipDenial`. No catch that proceeds. |
+| Injected `ownershipDeps` forging ownership | Works in-process (the lib is a deps wrapper). Not a client-facing bypass — production deps are the live maps. Note only. |
+| `applyOwnershipListRedaction` on `result.terminal` (show) | **Miss.** See N1. |
+| `scrollback` key instead of `preview` on a list row | **Miss.** Matcher looks for the key to decide "this is a list" but `redactTerminal` only `delete`s `preview`. Live list rows do not have `scrollback`. P1 latent. |
+| `envelope.error.preview` | Not stripped. Not a live list shape. |
+| `envelope.result.result.terminals` | Actually stripped — `redactTerminalListPayload` walks one `result.terminals`. |
+| stderr / stderrTail | Never inspected. Live list preview is stdout. |
+| Streamed / chunked | `runOrca` is `execFile`; client sees the finished `describeRun`. No mid-flight leak. |
+| MCP `orca-bridge://transcripts/*` and `dispatches/*` | Still fail-open on missing `clientKey`. See F5 / N2. Audit log records redacted **args**, not list payloads. Not a preview door. |
+| `action=check` | Argv still constructed internally; caller cannot inject `--terminal`. Holds. |
+
+The extraction into `lib/release-worker.mjs` is not itself a bypass. The new surface that is a bypass is **shape-based redaction that only knows about list rows**, plus **policy that only knows about a prefix table**.
+
+---
+
+### Priority 3 — `ORCA_BRIDGE_CLI_HARDENING` OFF (live VM posture)
+
+`ORCA_BRIDGE_CLI_HARDENING` is unset here. Default is still `!== '1'`.
+
+On the prefixes the fix named, the claim holds. Hardening off, ownership still denies:
+
+| argv | decision (hardening off) |
+|------|--------------------------|
+| `orchestration check --terminal FOREIGN` | `deny` / `handle_not_owned` |
+| `orchestration --json check --terminal FOREIGN` | `deny` / `handle_not_owned` |
+| `orchestration worker-read\|show --dispatch FOREIGN` | `deny` |
+| `orchestration worker-release\|stop\|abandon\|retain --dispatch FOREIGN` | `deny` |
+| `orchestration --json=true worker-release --dispatch FOREIGN` | `deny` |
+| `terminal read\|close --terminal FOREIGN` | `deny` |
+
+On every other handle- or worktree-accepting command the live CLI honours, ownership is **not consulted**. Soft-exec (`allow_with_warning`) is the whole control. That is the allowlist, not an ownership invariant.
+
+| argv | looksGated | hardening OFF | hardening ON |
+|------|------------|---------------|--------------|
+| `terminal show --terminal FOREIGN --json` | **false** | **`allow_with_warning` → CLI would return preview** | allowlist deny |
+| `terminal --json show --terminal FOREIGN` | false | same | deny |
+| `--json terminal show --terminal FOREIGN` | false | same | deny |
+| `terminal stop --worktree <foreign>` | false | **`allow_with_warning` → would stop every terminal in that worktree** | deny |
+| `worktree rm --worktree <foreign>` | false | **`allow_with_warning`** (NAS-202 checkout removal) | deny (admin) |
+| `orchestration inbox --terminal FOREIGN` | false | allow_with_warning | deny |
+| `terminal wait\|switch\|rename\|split --terminal FOREIGN` | false | allow_with_warning | deny |
+| `worktree ps --json` | false | allow_with_warning; shape redaction would strip worktree previews if present | deny |
+| `orchestration dispatch-show --task FOREIGN` | false | **`allow`** (allowlisted) | **`allow`** |
+| `orchestration worker-list` | false | allow_with_warning | deny |
+
+`terminal stop` and `worktree rm` were **not executed**. The proof is the guard not seeing a command the live CLI would honour. That is the same class of proof the first review used for F1.
+
+If anything still relies on the allowlist for an ownership guarantee, the ticket's premise is unmet. It does.
+
+---
+
+### Lead findings (this round)
+
+### N1 — P0 — `terminal show --json` is the list-redaction sibling the fix never named
+
+Live formatter (`terminal-format.js` `formatTerminalShow`):
+
+```
+preview: ${terminal.preview || '<empty>'}
+```
+
+Live JSON (own handle, keys only): `result.terminal.preview` exists; `result.terminals` does not.
+
+`looksLikeOwnershipGatedArgv` / `OWNERSHIP_GATED_PREFIXES` cover `terminal read|close|send` only. `terminal show` is the command whose summary is literally "Show terminal metadata and preview."
+
+`applyOwnershipListRedaction`:
+
+- `looksLikeTerminalListPayload` requires a `terminals[]` array (or a bare array of handle/preview rows)
+- `result.terminal` is a single object → not redacted
+- Human `terminal show` accidentally fail-closes (no `term_…` header line, so `preview:` is rewritten to `<redacted>`)
+- JSON does not
+
+Reproduction (hardening off — the live default). Do **not** point this at a foreign handle if you would log the body; the policy + shape proof is sufficient:
+
+```
+orca{ action: "cli", args: ["terminal", "show", "--terminal", "<foreign>", "--json"] }
+```
+
+Policy: `allow_with_warning`. CLI: honours. Redaction: no-op. Same `--json=true` / leading / interleaved `--json` forms as P0 #2, all still leaks, because the miss is the payload shape, not the flag spelling.
+
+This is why a description-matching review of `applyOwnershipListRedaction` plus the seven list argv rows would pass.
+
+### N2 — P0 — empty owned-set + await upsert forges `clientKey` and then passes the new release gate
+
+`partitionMailbox` (documented):
+
+```
+if (owned.size === 0) return { own: list, foreign: [], filtered: false };
+```
+
+`awaitDispatch` then, for every message in `own`:
+
+```
+dispatchRegistry.upsert(did, { status, runId, clientKey: ck, ... })
+```
+
+`upsert` is `{ ...prev, ...patch }`. A row that belonged to bob becomes `clientKey: alice`.
+
+`collectDispatchIdSets` / `requireOwnedDispatch`: `rowKey && rowKey === ck` → **owned**.
+
+In-process (no live run, no foreign teardown):
+
+```
+owned = empty Set
+messages = [{ type: 'worker_done', dispatchId: 'disp_bob', ... }]
+partitionMailbox → own=1, foreign=0
+upsert(disp_bob, { clientKey: 'alice' })
+requireOwnedDispatch('disp_bob', 'alice') → ok: true, status: 'owned'
+```
+
+Reachability:
+
+- **Bridge restart / first await:** `clientOwnership` is in-memory. Empty `dispatches` is the documented restart posture. The *release* path fail-closes on unknown; the *await* path fail-opens and then writes ownership.
+- **`action=await runId=<any existing run>`:** `run-use` is invoked via internal `runJson` (no policy). A client that knows or guesses a run id binds their sender, reads that mailbox, and if their `dispatches` set is empty, steals every `dispatchId` in it. I did **not** run this against a live foreign run — `run-use` would fence the owner's consumer.
+- **Suppression of `next.action=release` is gated on `owned.size > 0`.** Empty set → the coordinator is *told* to release the stolen id. The new preflight then allows it.
+
+This is not the MCP orphan-read the author deferred. It is a write-up of `clientKey`, which is the only key the new invariant uses. Every gate above is decorative after one empty-set await.
+
+### N3 — P0 (argv proof, not executed) — `terminal stop --worktree` still soft-executes
+
+The fix extended `DISPATCH_OWNERSHIP_GATED_PREFIXES` so `worker-stop` cannot soft-exec. `terminal stop --worktree` stops **every** terminal in a worktree and is not on any ownership list. Hardening off: `allow_with_warning`. That is the session-kill half of NAS-202, still allowlist-only.
+
+`worktree rm` is the checkout-removal half. Same posture. Ranked just below N3 because it is not handle-keyed; it is still an ownership-shaped teardown that the allowlist is the only brake on.
+
+### F3 (deferred) — P1 — `dispatch-show` still ungated, hardening on or off
+
+Allowlisted. `looksLikeOwnershipGatedArgv` is false. Returns assignee handle + dispatch / task / status. No PTY preview on the spec. The author called this out-of-scope / not P0. **As a preview leak, that deferral is correct.** As reconnaissance for N2 (run id / dispatch id / assignee handle), it is the oracle. Still P1, not P0, on its own.
+
+### F5 (deferred) — P2 as stated; P0 next to it was missed
+
+Confirmed still live, unchanged:
+
+- `registry.list({ clientKey })` keeps `!d.clientKey` rows
+- `readMcpResource` denies only if `clientKey && row.clientKey && row.clientKey !== clientKey`
+- `listMcpResources` advertises orphan transcript URIs to every client
+- Bound-to-bob rows are denied to alice (that half holds)
+- Empty `clientKey` does **not** make `requireOwnedDispatch` treat the row as owned (`rowKey && rowKey === ck` fails closed)
+
+So the deferred F5 *read* is still P2 (redacted mailbox excerpts + metadata, not PTY preview) and was not wrongly deferred **as written**. What was wrongly treated as "the clientKey story" is N2. An orphan/missing key is not forgeable into a release. An overwritten key is.
+
+`deriveClientKey` itself is not attacker-settable from tool args. `sessionClientKey` reuse, `master`/`anonymous`/`default` sharing, and stdio=`master` are single-tenant by design, not a multi-tenant forge.
+
+---
+
+### Priority 5 — opposite failure / tests
+
+| Check | Result |
+|-------|--------|
+| Legitimate owned `action=release` (in-process) | Works. `worker-release` after preflight. |
+| Close-fallback after `dispatch_not_found` | Works. Second `preflightCloseHandle` then `terminal close`. |
+| `runtimeId` flipped, same `clientKey` maps | Verdict unchanged. Not a resolver key. Ticket back-compat note holds. |
+| Unknown / missing / malformed | Fail-closed on release and on gated cli prefixes. |
+| Bridge-restart wipe of `clientOwnership` | Release fail-closes. **Await fail-opens (N2).** Asymmetric, and the dangerous half is await. |
+| Own `orchestration check` without `--terminal` | Still skip (pin inject). Own `--terminal` allows. |
+| Own `worker-read` | Allows. |
+
+**Tests.** 321 → 346 is +25 as claimed. They are better than the NAS-247 suite:
+
+- `lib/release-worker.test.mjs` (8 cases) drives `executeReleaseWorker` with a recording `runJson`. Foreign dispatch/handle → zero effects. This is a real effect test. It would have caught P0 #1.
+- `applyOwnershipListRedaction` table feeds a **pre-built list envelope** for each argv and never calls `describeRun`. Argv is unused. That would not have caught N1 (`result.terminal`) or the banner+pretty landmine.
+- Soft→deny / interleaved tables cover the named prefixes only. No `terminal show`, no `terminal stop`, no `dispatch-show`, no await upsert.
+
+A green 346 is consistent with both new P0s.
+
+---
+
+### Attack log (this round)
+
+Handles: `OWN=term_own_aaaaaaaa`, `FOREIGN=term_foreign_bbbbbbbb`, `OWN_D=disp_own`, `FOREIGN_D=disp_foreign`. Hardening off unless noted. No live mutating CLI.
+
+#### Release
+
+Already tabulated under P0 #1. All foreign / unknown / missing shapes denied with zero effects. Owned succeeds.
+
+#### List argv vs live `parseArgs`
+
+Already tabulated under P0 #2. Agreement between `flags.has('json')` and `argvWantsJson` for every form `BOOLEAN_FLAGS` actually accepts. Disagreement on `--JSON` / `-j` is both-fail (CLI does not honour them).
+
+#### Show / stop / other siblings
+
+See Priority 3 table. N1 is the live read P0. N3 is the argv-proof destructive P0.
+
+#### MCP / clientKey
+
+| Shape | Result |
+|-------|--------|
+| `appendTranscript('disp_orphan')` no upsert | listed to alice; body readable |
+| `upsert('disp_nobind', {status:'seen'})` | listed + readable |
+| `upsert('disp_bob', {clientKey:'bob'})` then alice read | denied |
+| empty owned-set + upsert overwrite (N2) | **alice owns bob's id** |
+
+---
+
+### Implementer-claim scorecard (this commit)
+
+| Claim | Accurate? |
+|-------|-----------|
+| `preflightReleaseOwnership` before any `runJson` (lookup / worker-release / close) | **Yes.** Reproduced. |
+| `server.mjs` is a thin deps wrapper over `lib/release-worker.mjs` | **Yes.** |
+| Redaction keys on response shape (envelope / JSON-stdout / human `preview:` lines) | **Only for list-shaped payloads.** `result.terminal.preview` (the live `terminal show` JSON) is untouched. Human show is accidentally redacted. |
+| `argvWantsJson` covers `--json=*` | **Yes.** Matches live `BOOLEAN_FLAGS` presence semantics, including `--json=false`. |
+| Ownership denies independently of `ORCA_BRIDGE_CLI_HARDENING` | **Only on the prefix tables they extended.** `terminal show`, `terminal stop`, `worktree rm`, `inbox`, `wait/switch/rename/split` still soft-exec. |
+| `looksLikeOwnershipGatedArgv` skips interleaved flags | **Yes**, for those prefixes. `orchestration --json check` denies. |
+| `DISPATCH_OWNERSHIP_GATED_PREFIXES` includes release/stop/abandon/retain | **Yes.** Soft-exec of those four is closed. |
+| Hardening remains allowlist-only | **Yes** — and that is why N1/N3 exist. |
+| F3 / F5 correctly deferred as non-P0 | **F3 yes (as preview). F5-as-read yes (P2). The clientKey write-up (N2) is P0 and was not in the deferral.** |
+| Tests 346 / 0 fail | **Yes** (this review). |
+| Legitimate coordinator release still works | **Yes** in-process, including `runtimeId` noise. |
+| Unknown fails closed | **Yes** on release / gated cli. **No** on await mailbox + upsert. |
+
+---
+
+### What I would not call a break
+
+- Closing the original five `terminal list` spellings. They are closed.
+- Wiring `requireOwnedDispatch` on `action=release`. That P0 is dead.
+- Deny-any on own-then-foreign. Conservative.
+- Over-redacting human `terminal show` / human `worktree ps` (no `term_…` header). Fail-closed, not a leak.
+- `worktree list` "redaction" against a runtime with no preview key.
+- Soft-mode allowlist warnings on *non-handle* commands, **if** one still accepts NAS-247's migration story. I do not accept it as satisfying NAS-248 once `terminal show` and `terminal stop` are in the handle/teardown set.
+- Deps injection in unit tests.
+
+---
+
+### Recommendation (not implemented — review is read-only)
+
+1. **Treat N1 as blocking.** Gate `terminal show` the same way as `terminal read` (prefix + `looksLikeOwnershipGatedArgv`). Extend `applyOwnershipListRedaction` to `result.terminal` / any object with `handle`+`preview`/`scrollback`, not just `terminals[]`. Add a test that feeds a live `printResult` show envelope through `describeRun` + redaction, not a hand-built list.
+2. **Treat N2 as blocking.** `partitionMailbox` must fail closed on an empty owned set (or await must refuse to run until this client has a registered dispatch). `upsert` must not overwrite a different `clientKey`. After restart, unknown must not become "alice owns everything she can see." Add an effect test: empty owned + foreign `worker_done` → zero upserts of `clientKey: alice` and `requireOwnedDispatch` still false.
+3. **Treat N3 as blocking for the NAS-202 claim.** `terminal stop --worktree` (and, if the invariant is real, `worktree rm`) cannot remain allowlist-only under hardening off.
+4. Keep F3 as a follow-up unless N2 stays open — then `dispatch-show` is the ID oracle and should be gated.
+5. Do not merge under "the two P0s are fixed, 346 green." They are fixed. The invariant is not.
+
+Independent suite: **346 pass / 0 fail / 0 skipped**.
