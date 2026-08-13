@@ -109,6 +109,11 @@ import {
   stateOwnershipWarnings,
   writeFilePreservingOwner,
   resolveTerminalHandleOwnership,
+  resolveDispatchOwnership,
+  requireOwnedHandle,
+  listOwnedTerminalHandles,
+  redactTerminalListPayload,
+  redactWorktreeListPayload,
 } from './lib/state-ownership.mjs';
 
 const execFile = promisify(execFileCb);
@@ -159,8 +164,10 @@ const TOOLSET_GATE = createToolsetGate({ env: process.env, argv: process.argv })
 // Opt-in cli allowlist. Default permissive (hardening off).
 // ORCA_BRIDGE_CLI_HARDENING=1 enforces deny-by-default allowlist.
 // Admin unlock follows the effective toolset admin bit (toolset collapse).
-// ownershipCheck closes over live senderCaches / clientOwnership / dispatchRegistry
-// (resolved at call time). client_key comes from requestContext via currentClientKey().
+// ownershipCheck / dispatchOwnershipCheck close over live maps (resolved at
+// call time). client_key comes from requestContext via currentClientKey().
+// NAS-248: ownership is a system invariant — handle paths AND dispatch-id
+// paths consult the same resolvers; action=release uses requireOwnedHandle.
 const CLI_POLICY = createCliPolicy({
   ...resolveCliPolicyConfig(process.env),
   admin: TOOLSET_GATE.admin,
@@ -180,6 +187,14 @@ const CLI_POLICY = createCliPolicy({
       clientOwnership,
       senderCaches,
       coordinatorHandles,
+    },
+  ),
+  dispatchOwnershipCheck: (ctx) => resolveDispatchOwnership(
+    ctx.dispatchId,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
     },
   ),
 });
@@ -539,6 +554,46 @@ function describeRun(run, wantJson) {
   out.stderr = tail(run.stderr);
   return out;
 }
+
+/**
+ * NAS-248: strip foreign PTY preview from action=cli list responses.
+ * Mutates `described` in place when envelope/result carries terminals/worktrees.
+ * Never call from runJson internals.
+ */
+function applyCliOwnershipRedaction(described, args) {
+  if (!described || typeof described !== 'object') return described;
+  if (!Array.isArray(args) || args.length < 2) return described;
+  const t0 = String(args[0] || '').toLowerCase();
+  const t1 = String(args[1] || '').toLowerCase();
+  const owned = listOwnedTerminalHandles(currentClientKey(), {
+    dispatchRegistry,
+    clientOwnership,
+    senderCaches,
+    coordinatorHandles,
+  });
+
+  const redactEnvelopeResult = (env) => {
+    if (!env || typeof env !== 'object') return env;
+    const result = env.result;
+    if (result == null) return env;
+    let nextResult = result;
+    if (t0 === 'terminal' && t1 === 'list') {
+      nextResult = redactTerminalListPayload(result, owned);
+    } else if (t0 === 'worktree' && t1 === 'list') {
+      nextResult = redactWorktreeListPayload(result);
+    } else {
+      return env;
+    }
+    if (nextResult === result) return env;
+    return { ...env, result: nextResult };
+  };
+
+  if (described.envelope) {
+    described.envelope = redactEnvelopeResult(described.envelope);
+  }
+  return described;
+}
+
 
 /**
  * Lazy runtime/version gate for dispatch/await/release (NAS-246).
@@ -1958,6 +2013,49 @@ async function releaseWorker(args = {}) {
     };
   }
 
+  // NAS-248: ownership invariant before close. Same resolver as action=cli.
+  // Fail-closed always (release is destructive; no soft mode). Keyed on
+  // clientKey only — never runtimeId. After bridge restart, in-memory
+  // workerHandles are gone → unknown → refuse (caller must re-dispatch or
+  // use break-glass outside the bridge).
+  {
+    const ownershipDeps = {
+      dispatchRegistry,
+      clientOwnership,
+      senderCaches,
+      coordinatorHandles,
+    };
+    const gate = requireOwnedHandle(handle, currentClientKey(), ownershipDeps);
+    if (!gate.ok) {
+      const own = gate.ownership;
+      const statusLabel = own.status === 'not-owned' ? 'not-owned' : 'unknown';
+      return {
+        ok: false,
+        mode: 'ownership_denied',
+        error: 'handle_not_owned',
+        code: 'handle_not_owned',
+        dispatch_id: dispatchId || null,
+        terminal_handle: handle,
+        ownership_status: statusLabel,
+        reason: own.reason || undefined,
+        owned_handles: own.owned_handles || [],
+        detail:
+          `Blocked: terminal handle "${handle}" is ${statusLabel} for this client.` +
+          ` Owned handles: ${(own.owned_handles || []).join(', ') || '(none)'}.` +
+          (own.reason ? ` reason=${own.reason}.` : '') +
+          ` Release only closes handles this client owns (dispatch worker or pin).`,
+        note: releaseNote,
+        worker_release: releaseRes?.envelope || releaseRes || null,
+        next: {
+          action: 'release_owned_handle',
+          detail:
+            "Pass terminal_handle from this client's action=dispatch response. " +
+            'Foreign handles and unknown handles (e.g. after bridge restart wiped workerHandles) are refused.',
+        },
+      };
+    }
+  }
+
   const closeRes = await runJson(
     ['terminal', 'close', '--terminal', handle, '--tab', '--json'],
     { timeoutMs: 30_000 },
@@ -2394,6 +2492,9 @@ async function callToolUnlocked(op, a) {
     }
     const run = await runOrca(argv, { timeoutMs: a.timeoutMs, cwd: a.cwd });
     const described = describeRun(run, a.args.includes('--json'));
+    // NAS-248: redact foreign scrollback at the cli response boundary only.
+    // Internal runJson (resolveSenderTerminal) is unredacted on purpose.
+    applyCliOwnershipRedaction(described, a.args);
     // NAS-239 dual-route: non-question reply → also send to dispatch:<id>.
     if (
       a.args[0] === 'orchestration' &&
