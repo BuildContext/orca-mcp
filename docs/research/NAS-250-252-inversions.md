@@ -1641,3 +1641,131 @@ The merge-blocking fix is small and in the existing tables, not a redesign:
 4. Optional P2: `--ack` UUID, `--json=false`, wire the `resolvers` map or delete it, owned-human withhold docs.
 
 Until (1) lands, NAS-251/252 are not closed. Do not merge.
+
+
+# Fix author closeout — r11 (`BuildContext/nas-248-ownership-invariant`)
+
+**Worktree:** `/home/orca/orca/workspaces/orca-mcp/nas-252-review-r9`  
+**Base:** `94ce4b0` (a119214 + r10 adversarial review)  
+**Scope:** exactly two items from the r10 follow-up — (1) gate shipped `--workspace` worktree selector; (2) derive address/content split from handler usage so MUT4b fails. No redesign, no AppImage re-plumb, no live foreign exec, no hardening flip on the live bridge.
+
+## What changed
+
+1. **`--workspace` → existing `worktreeOwnershipCheck`.**  
+   - Removed `'workspace'` from `NON_TARGET_FLAGS`.  
+   - Added `workspace: 'worktree'` to both `HANDLER_ADDRESS_FLAG_RESOLVERS` and `TARGET_FLAG_RESOLVERS`.  
+   - Collection: name-based worktree branch now covers any `resolver === 'worktree'` flag. `--worktree` still uses `collectWorktreeSelectorsFromArgv`; other worktree-class names (today: `--workspace`) use `collectFlagValuesFromArgv` + `classifyValueOwnershipKind` (Item 5 pattern). Worktree grammar (`path:`, `name:`, `branch:`, `issue:`, `id:`, absolute path) enters the checker; Linear UUID / non-orch values are ignored.  
+   - Effect-lock tests drive `evaluateCliArgv` for `automations create --workspace path:/foreign` with hardening **on and off**, assert `decision === 'deny'`, `ok === false`, `rejection.code === 'handle_not_owned'`, and that `worktreeOwnershipCheck` was invoked (the gate that blocks spawn). Owned `path:/own` is not ownership-denied. `automations edit` foreign workspace denies via the same checker. Every shipped automations command that accepts `--workspace` is covered; Linear `--workspace` UUID stays non-target by value.
+
+2. **Address/content split derived from handler usage, not a curated `TARGET_CAPABLE` name list.**  
+   - `HANDLER_ADDRESS_FLAG_RESOLVERS`: offline map of flags whose values the v1.4.180 handlers pass through as runtime target selectors (`getOptionalWorktreeSelector`, `--terminal`, `--dispatch`, value-typed `--to`/`--ack`/…, etc.).  
+   - `deriveRequiredAddressFlags(specs)` = that map **plus** every spec positional that is not in `SPEC_CONTENT_POSITIONAL_FLAGS` (the known content positionals: `path`, `file`, `text`, `query`, …). Unknown positionals (e.g. MUT4b `recipient`) become required address flags with `resolver: null` until classified target.  
+   - Differential test asserts: `TARGET_FLAG_RESOLVERS` deep-equals `HANDLER_ADDRESS_FLAG_RESOLVERS`; every derived name is `FLAG_TABLE.kind === 'target'` with a live resolver; non-content positionals stay target; `automations show auto_FOREIGN` still denies.
+
+### Special-case count
+
+- **Removed:** one misclassification (`workspace` as content/non_target); the hand-written `TARGET_CAPABLE` Set inside the differential test.  
+- **Added:** `HANDLER_ADDRESS_FLAG_RESOLVERS` (source of truth for handler-used selectors), `SPEC_CONTENT_POSITIONAL_FLAGS` (15 known content positionals), `deriveRequiredAddressFlags`, and a small collection branch for non-`--worktree` worktree-class flags (value-filtered).  
+- Net: **one special-case misfile closed**; the lock is stronger than a name list. Not a net special-case explosion — the content-positional list is finite and only the shipped content positionals.
+
+## Derivation coverage and limits
+
+**Covers**
+
+- Every flag in the offline handler audit that is a runtime ownership selector in v1.4.180, including the previously-misfiled `--workspace` (automations → `getOptionalWorktreeSelector`).  
+- Value-typed address flags (`to`, `ack`, `retry-of`, `parent`, `resume`) as TARGET names (values still resolved by grammar).  
+- Any **new positional** that is not already a known content positional: must be kind=target or the differential fails (MUT4b).  
+- Demotion of a handler address flag out of `TARGET_FLAG_RESOLVERS` / into `NON_TARGET` without updating the handler map (MUT3/MUT4a via deep-equal + kind assert).
+
+**Does not cover**
+
+- Automatic discovery of *new non-positional* address flags that only appear in `allowedFlags` (not as positionals) and are never added to `HANDLER_ADDRESS_FLAG_RESOLVERS`. A future `--recipient` that is flag-only (no positional) and classified NON_TARGET would still need a handler-map edit; MUT4b as written uses a positional and fails. Honest residual.  
+- Handler implementation drift vs the offline map (we do not read the AppImage at runtime; snapshot pin remains `CLI_SPEC_VERSION = 1.4.180`).  
+- MUT4c2-class always-owned stub at the real `runChecker` call site — still bound by effect tests (`@worktree`, `--workspace`, `--worktree`), not by the differential alone.  
+- `file open path:/foreign` (r10 P1-2) — **out of this two-item scope**; not fixed here.  
+- `--ack` UUID residual, owned-human withhold docs, wiring the completeness `resolvers` map (r10 P2).
+
+## Mutation output (re-run on real files, restored; md5 match post-restore)
+
+Script: `/tmp/nas-252-r11-mutation.sh`. Differential pattern: `spec differential`.
+
+```
+=== BASELINE (expect PASS) ===
+PASS
+# tests 3
+# pass 3
+# fail 0
+
+=== MUT1: add synthetic spec with new positional secretid ===
+MUT1 result: FAIL
+    not ok 1 - … every shipped allowed flag is classified …
+        unclassified shipped flags: secretid
+    not ok 2 - … every command positional promotes …
+    not ok 3 - … target-capable flags are kind=target …
+      error: 'missing FLAG_TABLE entry for derived address --secretid'
+# tests 3 / pass 0 / fail 3
+
+=== MUT2: add synthetic spec with new flag no resolver ===
+MUT2 result: FAIL
+    not ok 1 - … unclassified shipped flags: nonesuch-flag
+# tests 3 / pass 2 / fail 1
+
+=== MUT3: move id from TARGET / HANDLER to NON_TARGET ===
+MUT3 result: FAIL
+    not ok 3 - … target-capable …
+        TARGET_FLAG_RESOLVERS must equal HANDLER_ADDRESS_FLAG_RESOLVERS
+# tests 3 / pass 2 / fail 1
+
+=== MUT4a: reclassify address --to as content ===
+MUT4a result: FAIL
+    not ok 3 - … target-capable …
+        TARGET_FLAG_RESOLVERS must equal HANDLER_ADDRESS_FLAG_RESOLVERS
+# tests 3 / pass 2 / fail 1
+# defense-in-depth: evaluate --to @all still deny (VALUE_TYPED_ONLY / remaining TARGET entry)
+
+=== MUT4b: content-named address flag recipient as NON_TARGET + spec ===
+MUT4b result: FAIL
+    not ok 3 - … target-capable …
+        --recipient must be kind=target, got non_target
+# tests 3 / pass 2 / fail 1
+# deriveRequiredAddressFlags().has('recipient') === true, get === null
+# evaluate --recipient term_FOREIGN → allow_with_warning (gate not bound until classified target — lock is the differential)
+```
+
+**Summary: MUT1=FAIL MUT2=FAIL MUT3=FAIL MUT4a=FAIL MUT4b=FAIL.** All required mutations fail. Files restored after each mutation.
+
+## Suite counts
+
+| | tests | pass | fail |
+|--|------:|-----:|-----:|
+| Before (a119214 / 94ce4b0) | 427 | 427 | 0 |
+| After r11 | 434 | 434 | 0 |
+
+(+7): workspace effect-lock / derivation suite.
+
+## Coordinator regressions (still hold)
+
+Re-probed via `evaluateCliArgv` after the change:
+
+- `linear issue NAS-252` → not ownership-denied  
+- owned `reply`/`terminal send` with token-shaped content → allow  
+- `computer permissions --id accessibility` → not ownership-denied  
+- owned `terminal list --worktree path:/own`, `worktree list --repo` → allow  
+- owned `automations create --workspace path:/own` → not ownership-denied  
+- foreign `automations create --workspace path:/foreign` → **deny** `handle_not_owned` (on and off)  
+- `--to @all` → deny  
+
+HELD 1–21 unit smoke paths in existing tests still pass under the full suite.
+
+## What I could not prove
+
+- Did **not** re-drive isolated HTTP bridge spawn for `--workspace` (unit effect-lock asserts checker invocation + deny before allowlist; production `action=cli` returns `policyResult.rejection` before `runOrca` when `!ok` — same HELD 10 path). A reviewer should still spawn-prove on an isolated HOME if they want byte-level fake-orca empty argv.  
+- Did **not** close the naming class for **flag-only** (non-positional) content-named address flags; MUT4b closes the positional/class that r10 used and that `--workspace` exemplified once it was on the handler map.  
+- Did **not** fix r10 P1-2 `file open path:/foreign` (explicitly out of the two-item scope).  
+- Did **not** bind MUT4c2 at the differential layer.  
+- Did **not** live-exec foreign automations/worktrees or flip live `ORCA_BRIDGE_CLI_HARDENING`.
+
+## Honesty
+
+The previous closeout claimed mutations were locked while MUT4b stayed green because the assertion was a weaker name list. This wave makes the differential assert `deriveRequiredAddressFlags` (handler map ∪ non-content positionals) and re-ran MUT1–MUT4b on the real files. MUT4b now fails. If a reviewer invents a flag-only content-named address without a positional and without a handler-map entry, say so — that residual is documented above, not papered over.
+
