@@ -324,3 +324,78 @@ Both a false allow (F1) and a false deny (post-bridge-restart close) exist. The 
 
 Probe JSON: `/tmp/nas-248-attack-probe.json`  
 Probe script: `/tmp/nas-248-attack-probe.mjs`
+
+---
+
+## Fix pass (bypass repair) — 2026-08-13
+
+**Worker:** NAS-248 bypass-fix dispatch on `BuildContext/nas-248-ownership-invariant`  
+**Base:** `ee61c23` (adversarial review)  
+**Production touch:** `server.mjs`, `lib/cli-policy.mjs`, `lib/state-ownership.mjs`, new `lib/release-worker.mjs`  
+**Suite:** **346 pass / 0 fail / 0 skipped** (was 321; +25 effect-driving / shape / interleaved-flag regressions)
+
+### P0 #1 — `action=release` gate-before-effect
+
+**Restructure:** extracted `lib/release-worker.mjs` with `preflightReleaseOwnership` → `executeReleaseWorker`. Ordering is now hard:
+
+1. `requireOwnedDispatch(dispatchId)` via `resolveDispatchOwnership` (when id present)
+2. `requireOwnedHandle(handleHint)` via `resolveTerminalHandleOwnership` (when handle present)
+3. **Only then** optional lookup / `worker-release` / close
+4. Close path re-checks handle via `preflightCloseHandle` before `terminal close`
+
+`server.mjs` `releaseWorker` is a thin wrapper: runtime-ready + live deps → `executeReleaseWorker`. No `runJson` of any kind (including "harmless" lookup) runs ahead of the gate. `requireOwnedDispatch` is wired; no third argv extractor.
+
+Regression: `lib/release-worker.test.mjs` drives the real effect path with a mocked `runJson` recorder — foreign `dispatchId` yields `ownership_denied` and **zero** effect calls. Owned close-fallback after `dispatch_not_found` still works (back-compat held).
+
+### P0 #2 — shape-based list redaction
+
+**Restructure:** `applyOwnershipListRedaction(described, ownedHandles)` in `state-ownership.mjs` keys on **response shape**:
+
+- envelope / envelope.result / bare payload with `terminals[]` → `redactTerminalListPayload`
+- worktree preview rows → `redactWorktreeListPayload`
+- JSON stdout when envelope missing (`--json=true` / `--json=` paths)
+- human stdout `preview:` lines → `redactTerminalListHumanStdout` (owned keep, foreign → `<redacted>`)
+
+`applyCliOwnershipRedaction` in `server.mjs` no longer inspects `args[0]`/`args[1]`. `argvWantsJson` treats `--json`, `--json=true`, `--json=` as JSON so envelopes parse when present; redaction still works without envelope via stdout shape.
+
+Table-tested argv spellings: plain list, `--json`, `--json=true`, `--json=`, `--json terminal list`, `terminal --json list`, case variants.
+
+### P1 — ownership independent of hardening
+
+**Findings that relied on the hardening flag for ownership (now fixed):**
+
+1. `ownershipDecision` soft-returned `allow_with_warning` when `!hardening` — **removed**. Ownership always denies; `onWarning` still fires for observability under soft allowlist posture.
+2. Interleaved globals (`orchestration --json check`) made `looksLikeOwnershipGatedArgv` false (adjacent-token only) so ownership was skipped and soft mode executed — **fixed** by flag-skipping scanner (leading *and* interleaved).
+3. Soft-exec path for `worker-release|stop|abandon|retain` under hardening off — **gated** by expanding `DISPATCH_OWNERSHIP_GATED_PREFIXES` and the same always-deny ownershipDecision. Allowlist still denies these under hardening on (unchanged); ownership now stops them with hardening off too.
+
+Hardening remains the **allowlist** migration knob only. Default is still off (`ORCA_BRIDGE_CLI_HARDENING !== '1'`). NAS-227 not touched.
+
+### What still holds (no regression)
+
+- Canonical check / worker-read / worker-show deny-any
+- Unknown `--id` / `--dispatch-id` fail closed (collector sees nothing)
+- Close-fallback still calls ownership before close
+- No `runtimeId` keying
+- Unknown ownership fail-closed in resolvers
+- Coordinator releasing own handle in-process still works (owned worker-release + close-fallback tests)
+
+### Disagreement with the review
+
+**None on the P0/P1 breaks** — F1/F2/F4 were accurate against `69b1c9f`/`ee61c23` code. Minor notes:
+
+- F3's `dispatch-show` assignee-handle metadata leak is real but out of scope for this pass (not P0; no PTY preview). Left as follow-up.
+- F5 MCP orphan `clientKey` fail-open is real P2; not in this ticket's DoD.
+- Soft-mode allowlist warnings remain for *non-ownership* misses (`cli_policy_would_deny`) — intentional NAS-247 migration story; only ownership was inverted to invariant.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `lib/release-worker.mjs` | new — gate-first release orchestration |
+| `lib/release-worker.test.mjs` | new — effect-ordering regressions |
+| `lib/state-ownership.mjs` | `applyOwnershipListRedaction`, human stdout redaction |
+| `lib/state-ownership.test.mjs` | shape/argv table tests |
+| `lib/cli-policy.mjs` | always-deny ownership; interleaved flag scan; teardown prefixes |
+| `lib/cli-policy.test.mjs` | soft→deny expectations; interleaved P1 table |
+| `server.mjs` | thin release wrapper; shape redaction; `argvWantsJson` |
+| this doc | append-only findings |

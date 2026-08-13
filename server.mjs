@@ -110,11 +110,10 @@ import {
   writeFilePreservingOwner,
   resolveTerminalHandleOwnership,
   resolveDispatchOwnership,
-  requireOwnedHandle,
   listOwnedTerminalHandles,
-  redactTerminalListPayload,
-  redactWorktreeListPayload,
+  applyOwnershipListRedaction,
 } from './lib/state-ownership.mjs';
+import { executeReleaseWorker } from './lib/release-worker.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -166,8 +165,8 @@ const TOOLSET_GATE = createToolsetGate({ env: process.env, argv: process.argv })
 // Admin unlock follows the effective toolset admin bit (toolset collapse).
 // ownershipCheck / dispatchOwnershipCheck close over live maps (resolved at
 // call time). client_key comes from requestContext via currentClientKey().
-// NAS-248: ownership is a system invariant — handle paths AND dispatch-id
-// paths consult the same resolvers; action=release uses requireOwnedHandle.
+// NAS-248: ownership is a system invariant independent of the hardening flag.
+// Hardening governs allowlisting only. action=release gates via requireOwned*.
 const CLI_POLICY = createCliPolicy({
   ...resolveCliPolicyConfig(process.env),
   admin: TOOLSET_GATE.admin,
@@ -555,44 +554,41 @@ function describeRun(run, wantJson) {
   return out;
 }
 
-/**
- * NAS-248: strip foreign PTY preview from action=cli list responses.
- * Mutates `described` in place when envelope/result carries terminals/worktrees.
- * Never call from runJson internals.
- */
-function applyCliOwnershipRedaction(described, args) {
-  if (!described || typeof described !== 'object') return described;
-  if (!Array.isArray(args) || args.length < 2) return described;
-  const t0 = String(args[0] || '').toLowerCase();
-  const t1 = String(args[1] || '').toLowerCase();
-  const owned = listOwnedTerminalHandles(currentClientKey(), {
-    dispatchRegistry,
-    clientOwnership,
-    senderCaches,
-    coordinatorHandles,
-  });
-
-  const redactEnvelopeResult = (env) => {
-    if (!env || typeof env !== 'object') return env;
-    const result = env.result;
-    if (result == null) return env;
-    let nextResult = result;
-    if (t0 === 'terminal' && t1 === 'list') {
-      nextResult = redactTerminalListPayload(result, owned);
-    } else if (t0 === 'worktree' && t1 === 'list') {
-      nextResult = redactWorktreeListPayload(result);
-    } else {
-      return env;
-    }
-    if (nextResult === result) return env;
-    return { ...env, result: nextResult };
-  };
-
-  if (described.envelope) {
-    described.envelope = redactEnvelopeResult(described.envelope);
+/** True when argv requests JSON (`--json`, `--json=true`, `--json=`). */
+function argvWantsJson(args) {
+  if (!Array.isArray(args)) return false;
+  for (const a of args) {
+    const s = String(a);
+    if (s === '--json') return true;
+    if (s.startsWith('--json=')) return true;
   }
-  return described;
+  return false;
 }
+
+
+/**
+ * NAS-248: strip foreign PTY preview/scrollback from action=cli responses.
+ * Keys on RESPONSE SHAPE (terminal/worktree rows with preview content), not
+ * argv position. Mutates `described` in place for envelope and/or stdout.
+ * Never call from runJson internals (resolveSenderTerminal needs full inventory).
+ *
+ * @param {object} described
+ * @param {string[]} [_args] retained for call-site compatibility; ignored
+ * @param {Iterable<string>|Set<string>} [ownedHandles]
+ */
+function applyCliOwnershipRedaction(described, _args, ownedHandles) {
+  if (!described || typeof described !== 'object') return described;
+  const owned =
+    ownedHandles ??
+    listOwnedTerminalHandles(currentClientKey(), {
+      dispatchRegistry,
+      clientOwnership,
+      senderCaches,
+      coordinatorHandles,
+    });
+  return applyOwnershipListRedaction(described, owned);
+}
+
 
 
 /**
@@ -1914,179 +1910,27 @@ async function releaseWorker(args = {}) {
   } catch (e) {
     return runtimeGuardRejection(e);
   }
-  const dispatchId = String(args.dispatch_id || '').trim();
-  const handleHint = String(args.terminal_handle || args.handle || '').trim();
-  if (!dispatchId && !handleHint) throw new Error('dispatch_id (or terminal handle) is required');
-
-
-  // Inject-path (bridge default): after worker_done the Dispatch is already completed
-  // and worker-release often returns dispatch_not_found. That is expected — cleanup is
-  // terminal close --tab using the handle from dispatch. Prefer handle when provided.
-  let handle = handleHint;
-  if (!handle && dispatchId) {
-    for (const argv of [
-      ['orchestration', 'dispatch-show', '--task', String(args.task_id || ''), '--json'],
-      ['orchestration', 'worker-show', '--dispatch', dispatchId, '--json'],
-    ]) {
-      if (argv.includes('--task') && !args.task_id) continue;
-      const show = await runJson(argv, { timeoutMs: 30_000 });
-      if (!envOk(show)) continue;
-      const r = show.envelope?.result || {};
-      handle =
-        pick(r.dispatch, 'assignee_handle') ||
-        pick(r.worker, 'agent_terminal_handle', 'agentTerminalHandle') ||
-        pick(r, 'assignee_handle', 'handle') ||
-        '';
-      if (handle) break;
-    }
-  }
-
-  // Optional worker-release (worker-start path only). Never treat dispatch_not_found as hard fail.
-  let releaseRes = null;
-  let releaseNote = null;
-  if (dispatchId) {
-    releaseRes = await runJson(
-      ['orchestration', 'worker-release', '--dispatch', dispatchId, '--json'],
-      { timeoutMs: 60_000 },
-    );
-    if (envOk(releaseRes) || releaseRes?.ok === true) {
-      if (dispatchId) {
-        dispatchRegistry.upsert(dispatchId, {
-          status: 'released',
-          mode: 'worker-release',
-          clientKey: currentClientKey(),
-          terminalHandle: handle || null,
-        });
-      }
-      return {
-        ok: true,
-        mode: 'worker-release',
-        dispatch_id: dispatchId,
-        terminal_handle: handle || null,
-        result: releaseRes.envelope?.result ?? releaseRes,
-        next: {
-          action: 'ack_and_finish',
-          detail: 'worker-release ok (supervised worker-start path). Ack delivery if needed.',
-        },
-      };
-    }
-    const code = releaseRes?.envelope?.error?.code || releaseRes?.error?.code || '';
-    releaseNote =
-      code === 'dispatch_not_found'
-        ? 'worker-release: dispatch_not_found (normal for inject-path after worker_done)'
-        : `worker-release failed: ${code || 'unknown'} — falling back to terminal close`;
-  }
-
-  if (!handle) {
-    return {
-      ok: false,
-      mode: 'none',
-      dispatch_id: dispatchId || null,
-      worker_release: releaseRes?.envelope || releaseRes,
-      error: 'no terminal handle to close; pass terminalHandle from dispatch response',
-      note: releaseNote,
-      next: {
-        action: 'manual',
-        detail: 'Pass terminalHandle from dispatch.terminal_handle, then release again.',
-      },
-    };
-  }
-
-  // Mechanism B: never close the durable coordinator sender tab.
-  // Closing it fences the run (coordinator_handle gone) before ack can complete.
-  if (releaseRefusesCoordinator(handle, coordinatorHandles)) {
-    return {
-      ok: false,
-      mode: 'refused_coordinator_terminal',
-      dispatch_id: dispatchId || null,
-      terminal_handle: handle,
-      error:
-        'terminalHandle is a bridge coordinator sender — will not close (would fence the run). ' +
-        'Pass the worker terminal_handle from the dispatch response, not the sender from health.',
-      note: releaseNote,
-      worker_release: releaseRes?.envelope || releaseRes || null,
-      next: {
-        action: 'release_with_worker_handle',
-        detail:
-          'Use terminal_handle from action=dispatch (worker tab). Coordinator tabs stay open for run-use/await/ack.',
-      },
-    };
-  }
-
-  // NAS-248: ownership invariant before close. Same resolver as action=cli.
-  // Fail-closed always (release is destructive; no soft mode). Keyed on
-  // clientKey only — never runtimeId. After bridge restart, in-memory
-  // workerHandles are gone → unknown → refuse (caller must re-dispatch or
-  // use break-glass outside the bridge).
-  {
-    const ownershipDeps = {
-      dispatchRegistry,
-      clientOwnership,
-      senderCaches,
-      coordinatorHandles,
-    };
-    const gate = requireOwnedHandle(handle, currentClientKey(), ownershipDeps);
-    if (!gate.ok) {
-      const own = gate.ownership;
-      const statusLabel = own.status === 'not-owned' ? 'not-owned' : 'unknown';
-      return {
-        ok: false,
-        mode: 'ownership_denied',
-        error: 'handle_not_owned',
-        code: 'handle_not_owned',
-        dispatch_id: dispatchId || null,
-        terminal_handle: handle,
-        ownership_status: statusLabel,
-        reason: own.reason || undefined,
-        owned_handles: own.owned_handles || [],
-        detail:
-          `Blocked: terminal handle "${handle}" is ${statusLabel} for this client.` +
-          ` Owned handles: ${(own.owned_handles || []).join(', ') || '(none)'}.` +
-          (own.reason ? ` reason=${own.reason}.` : '') +
-          ` Release only closes handles this client owns (dispatch worker or pin).`,
-        note: releaseNote,
-        worker_release: releaseRes?.envelope || releaseRes || null,
-        next: {
-          action: 'release_owned_handle',
-          detail:
-            "Pass terminal_handle from this client's action=dispatch response. " +
-            'Foreign handles and unknown handles (e.g. after bridge restart wiped workerHandles) are refused.',
-        },
-      };
-    }
-  }
-
-  const closeRes = await runJson(
-    ['terminal', 'close', '--terminal', handle, '--tab', '--json'],
-    { timeoutMs: 30_000 },
-  );
-  const closed = envOk(closeRes) || closeRes.ok === true;
-  if (dispatchId) {
-    dispatchRegistry.upsert(dispatchId, {
-      status: closed ? 'released' : 'release_failed',
-      mode: 'terminal-close',
-      clientKey: currentClientKey(),
-      terminalHandle: handle,
-    });
-  }
-
-  return {
-    ok: closed,
-    mode: 'terminal-close',
-    expected_for_inject_path: true,
-    dispatch_id: dispatchId || null,
-    terminal_handle: handle,
-    note: releaseNote,
-    worker_release: releaseRes?.envelope || releaseRes || null,
-    result: closeRes.envelope?.result ?? closeRes,
-    next: {
-      action: 'ack_and_finish',
-      detail:
-        'Inject-path cleanup = terminal close --tab (worker-release N/A after settle). ' +
-        'Ack mailbox if needed, then report. Not a failure when mode=terminal-close and ok=true.',
-    },
+  // NAS-248 / NAS-202: ownership of dispatchId AND handle is judged BEFORE any
+  // effect (lookup, worker-release, close). executeReleaseWorker enforces that
+  // ordering; this wrapper only supplies live deps + I/O.
+  const ownershipDeps = {
+    dispatchRegistry,
+    clientOwnership,
+    senderCaches,
+    coordinatorHandles,
   };
+  return executeReleaseWorker(args, {
+    clientKey: currentClientKey(),
+    ownershipDeps,
+    runJson,
+    envOk,
+    pick,
+    releaseRefusesCoordinator,
+    coordinatorHandles,
+    upsertDispatch: (id, row) => dispatchRegistry.upsert(id, row),
+  });
 }
+
 
 // --- MCP tools ---------------------------------------------------------------
 // Hyperagent custom MCP currently exports only ONE action from this server
@@ -2491,8 +2335,8 @@ async function callToolUnlocked(op, a) {
       }
     }
     const run = await runOrca(argv, { timeoutMs: a.timeoutMs, cwd: a.cwd });
-    const described = describeRun(run, a.args.includes('--json'));
-    // NAS-248: redact foreign scrollback at the cli response boundary only.
+    const described = describeRun(run, argvWantsJson(a.args));
+    // NAS-248: redact foreign scrollback by RESPONSE SHAPE, not argv spelling.
     // Internal runJson (resolveSenderTerminal) is unredacted on purpose.
     applyCliOwnershipRedaction(described, a.args);
     // NAS-239 dual-route: non-question reply → also send to dispatch:<id>.
