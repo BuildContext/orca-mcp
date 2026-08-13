@@ -111,6 +111,11 @@ import {
   resolveTerminalHandleOwnership,
   resolveDispatchOwnership,
   resolveWorktreeOwnership,
+  resolveTaskOwnership,
+  resolveRunOwnership,
+  resolveGenericIdOwnership,
+  resolvePageOwnership,
+  resolveRepoOwnership,
   listOwnedTerminalHandles,
   applyOwnershipListRedaction,
 } from './lib/state-ownership.mjs';
@@ -203,6 +208,50 @@ const CLI_POLICY = createCliPolicy({
     {
       dispatchRegistry,
       clientOwnership,
+      allowSyntheticCreate: ctx.allowSyntheticCreate === true,
+    },
+  ),
+  taskOwnershipCheck: (ctx) => resolveTaskOwnership(
+    ctx.taskId,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+    },
+  ),
+  runOwnershipCheck: (ctx) => resolveRunOwnership(
+    ctx.runId,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+    },
+  ),
+  idOwnershipCheck: (ctx) => resolveGenericIdOwnership(
+    ctx.id,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+    },
+  ),
+  pageOwnershipCheck: (ctx) => resolvePageOwnership(
+    ctx.pageId,
+    currentClientKey(),
+    {},
+  ),
+  repoOwnershipCheck: (ctx) => resolveRepoOwnership(
+    ctx.repo,
+    currentClientKey(),
+    {},
+  ),
+  parentWorktreeOwnershipCheck: (ctx) => resolveWorktreeOwnership(
+    ctx.worktree,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+      allowSyntheticCreate: false,
     },
   ),
 });
@@ -241,6 +290,7 @@ function ownershipFor(clientKey) {
       runs: new Set(),
       dispatches: new Set(),
       workerHandles: new Set(),
+      tasks: new Set(),
       boundRunId: null,
       boundSender: null,
     };
@@ -254,11 +304,15 @@ function ownershipFor(clientKey) {
  * When `clientKey` is omitted, uses the active request client.
  * runId-only calls (await/check rebind) do NOT claim dispatch ownership.
  */
-function registerOwnedDispatch({ runId, dispatchId, terminalHandle, clientKey } = {}) {
+function registerOwnedDispatch({ runId, dispatchId, terminalHandle, taskId, clientKey } = {}) {
   const reg = ownershipFor(clientKey || currentClientKey());
   if (runId) reg.runs.add(String(runId));
   if (dispatchId) reg.dispatches.add(String(dispatchId));
   if (terminalHandle) reg.workerHandles.add(String(terminalHandle));
+  if (taskId) {
+    if (!reg.tasks) reg.tasks = new Set();
+    reg.tasks.add(String(taskId));
+  }
 }
 
 function rememberCoordinatorHandle(handle) {
@@ -413,6 +467,7 @@ function loadPersistedOwnership() {
         runId: b.runId || null,
         dispatchId,
         terminalHandle: b.terminalHandle || null,
+        taskId: b.taskId || null,
         clientKey,
       });
       n += 1;
@@ -443,8 +498,8 @@ function bindOwnedDispatch({
   const ck = clientKey || currentClientKey();
   const id = dispatchId != null ? String(dispatchId).trim() : '';
   if (!id) {
-    // No dispatch id yet — track run/handle only (not a claimable ownership row).
-    registerOwnedDispatch({ runId, terminalHandle, clientKey: ck });
+    // No dispatch id yet — track run/handle/task only (not a claimable ownership row).
+    registerOwnedDispatch({ runId, terminalHandle, taskId, clientKey: ck });
     return { ok: true, claimed: false };
   }
   const bound = dispatchRegistry.bindOwner(id, {
@@ -468,6 +523,7 @@ function bindOwnedDispatch({
     runId,
     dispatchId: id,
     terminalHandle,
+    taskId,
     clientKey: ck,
   });
   persistOwnershipBindings();

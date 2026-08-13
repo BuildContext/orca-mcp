@@ -440,3 +440,125 @@ Run at `bb755f5` in `/home/orca/orca/workspaces/orca-mcp/nas-250-252-inversions`
 
 Probe script: `/tmp/nas-250-252-attack-probe.mjs`. Live key dumps (no bodies): `/tmp/nas-250-252-live/`.
 
+
+---
+
+# Fix wave — real inversions A/B (post `3e4e6da` review)
+
+**Author:** dispatched fix worker (NAS-250/251/252 real inversion)  
+**Branch:** `BuildContext/nas-248-ownership-invariant`  
+**Baseline HEAD:** `3e4e6da` (bb755f5 code + adversarial review)  
+**Suite before:** 388 pass / 0 fail  
+**Suite after:** 406 pass / 0 fail  
+
+## What changed
+
+### A — ARGV allowlist (not selector blocklist)
+
+`lib/cli-policy.mjs` now drives ownership from **one table**:
+
+- `FLAG_TABLE` / `TARGET_FLAG_RESOLVERS` / `NON_TARGET_FLAGS` / `ADMIN_SELECTOR_FLAGS`
+- Every long-flag on argv is classified. **Unclassified → DENY.**
+- Every target entry binds a resolver kind (`handle|dispatch|worktree|parent_worktree|task|run|id|page|repo`).
+- `evaluateCliArgv` consumes that table; `assertTargetFlagResolversComplete()` fails if any target lacks a resolver.
+- Flags enumerated from shipped CLI **v1.4.180** specs (`allowedFlags` + usage `--flags` + GLOBAL/BOOLEAN).
+
+Selector kinds newly enforced (were documentation-only at bb755f5):
+
+| Flag | Resolver | Notes |
+|------|----------|-------|
+| `--task` / `--task-id` | task | closes P0-1 dispatch-show |
+| `--run` | run | closes P0-2 task-list / worker-list |
+| `--id` | id (task→run→dispatch; `msg_*` runtime-scoped) | closes run-show / reply path |
+| `--page` | page | fail-closed (no page registry) |
+| `--parent-worktree` | parent_worktree → worktree | |
+| `--repo` | repo | fail-closed unless deps.ownedRepos |
+
+**run-list:** takes no selector and returned 100 foreign runs live. **Denied** unscoped (`unscoped_run_list`). Justification: no safe default scope without a caller-owned `--run`/`--id`; coordinators already bind a run via dispatch/await.
+
+Ownership decisions are **identical with hardening on and off**. Hardening remains allowlist-only.
+
+### B — RESPONSE inventory allowlist (not content-key blocklist)
+
+`lib/state-ownership.mjs`:
+
+- Deleted the deny-list strategy as the redaction engine. `TERMINAL_CONTENT_KEYS` remains only as a legacy/effect-helper list.
+- New `INVENTORY_ALLOWLIST_KEYS` + `isInventoryAllowlistKey`.
+- Non-owned nodes keep **only** inventory keys (ids, handles, states, booleans, counts, timestamps, branch, structural containers).
+- Everything else stripped: preamble, spec, objective, payload, subject, body, stdout, stderr, blocks, prompt, tail, …
+- Handle attribution uses `handle|terminalHandle|assignee_handle|from_handle|to_handle|coordinator_handle|created_by_terminal_handle|…`.
+- No resolvable handle → inherit parent ownership; default **strip**.
+- Non-owned rows also drop `title` / `worktreePath` / `path` (P1-4). Owned rows keep full content. HELD item 7 still holds for `preview` strip + inventory ids/state.
+
+P2-1 (key-name enumeration) is **subsumed by inversion B**.
+
+### C — False deny (P1-2)
+
+Selector kinds route to **their own** resolver only. A `--worktree` argv no longer triggers a null-handle check. Verified allow:
+
+- `terminal list --worktree <own>`
+- `worktree show --worktree <own>`
+- `file open … --worktree <own>`
+
+### D — Uniform deny (P1-3)
+
+Caller-facing rejection is one shape:
+
+- `code: 'handle_not_owned'`, `error: 'cli_policy_denied'`
+- Uniform detail string (no foreign vs unknown, no owned_* lists)
+- **No** `ownership_status`, `reason`, `owned_handles`, `owned_worktrees`, `owned_dispatches`, `handle`/`dispatch_id` oracle fields on the rejection
+
+Distinctions remain only in the local `onWarning` audit payload (`_audit_*` fields).
+
+### E — inbox (P0-3)
+
+`injectSenderArgv` now injects `--terminal <pin>` for **both** `check` and `inbox`. Inbox is mailbox-scoped like check; no longer host-wide under hardening off. Defense-in-depth: response redaction still strips body/payload/subject on non-owned message nodes.
+
+### F — synthetic stop (P2-2)
+
+`resolveWorktreeOwnership('new-child'|'new-top-level')` returns **owned** only when `deps.allowSyntheticCreate === true`. Policy sets that only for `worktree create` / `worker-start`. `terminal stop --worktree new-child` → deny.
+
+## P0 / P1 scorecard
+
+| ID | Finding | Status |
+|----|---------|--------|
+| P0-1 | dispatch-show --task foreign (+preamble) | **Fixed** — task resolver deny, hard on/off |
+| P0-2 | task-list/run-show/run-list/worker-list foreign content | **Fixed** — run/id resolvers; run-list unscoped deny |
+| P0-3 | inbox host-wide + payload leak | **Fixed** — pin inject + inventory redaction |
+| P1-1 | TARGET_SELECTOR_FLAGS unwired | **Fixed** — FLAG_TABLE consumed by evaluate |
+| P1-2 | false deny list/show/file --worktree | **Fixed** — per-kind routing |
+| P1-3 | deny existence oracle + owned_* leak | **Fixed** — uniform rejection |
+| P1-4 | title/worktreePath recon on foreign rows | **Fixed** — stripped on non-owned |
+| P2-1 | content-key enumeration | **Subsumed by B** |
+| P2-2 | stop --worktree new-child synthetic own | **Fixed** |
+| P2-3 | worktree path-alias bypass | **HELD** (still fail-closed) |
+
+## HELD (13) — still required
+
+Unit-pinned via existing NAS-250/251/252 tables + new NAS-252 real-inversion suite. All 13 behaviours from the review remain enforced (show/stop deny on/off, deny-any dups, interleaved worker-read, missing checker fail-closed, list/show preview strip, owned read/worker-read/check allow, server short-circuit, release preflight, no runtimeId keying, forbidden handoff).
+
+## Files touched
+
+| File | Change |
+|------|--------|
+| `lib/cli-policy.mjs` | FLAG_TABLE allowlist gate; uniform deny; multi-kind evaluate |
+| `lib/cli-policy.test.mjs` | Effect tests for new selectors; oracle asserts removed; HELD retained |
+| `lib/state-ownership.mjs` | Collectors + task/run/id/page/repo resolvers; inventory allowlist redaction; synthetic guard |
+| `lib/state-ownership.test.mjs` | preamble/spec/payload/title strip; synthetic stop |
+| `lib/security-core.mjs` | inbox pin inject |
+| `lib/security-core.test.mjs` | inbox inject pin |
+| `server.mjs` | Wire task/run/id/page/repo/parent checkers; register taskId; synthetic flag |
+| `docs/research/NAS-250-252-inversions.md` | This section |
+
+## What I could not prove
+
+1. **Did not re-run live foreign-handle/task probes on the shared contour.** Task forbids destructive live commands against foreign objects. Gate denials and redaction are unit-proven against v1.4.180 shapes and the reviewer's argv catalogue; not re-spawned through a second live MCP client on a foreign tab.
+2. **Page / repo ownership has no durable registry.** `--page` and bare `--repo` fail closed (`unknown`) unless tests inject `ownedPageIds` / `ownedRepos`. A future browser-session ownership store would need wiring; today that is intentional deny.
+3. **`msg_*` reply ids are runtime-scoped, not bridge-indexed.** `resolveGenericIdOwnership` treats `msg_*` as owned so legitimate `orchestration reply --id msg_…` is not false-denied. The runtime + injected `--from` pin remain the real mailbox boundary. I did not prove a foreign msg id cannot be replied to if the runtime accepts it under the caller's pin — that is a runtime concern outside this gate.
+4. **Task ownership depends on dispatch-time `taskId` registration.** Tasks never recorded on `dispatchRegistry` / `clientOwnership.tasks` resolve `unknown` (denied). Path is correct for bridge-dispatched work; ad-hoc CLI task ids the bridge never saw fail closed.
+5. **run-list is hard-denied unscoped** rather than filtered to owned runs post-hoc. Filtering would need a response-path run allowlist walk; deny is the conservative choice and matches "no selector → no proof".
+6. **Did not flip `ORCA_BRIDGE_CLI_HARDENING`, restart the bridge, publish, or bump the version.**
+7. **NAS-249 / NAS-253 bind oracles untouched** (out of scope).
+8. **Human stdout redaction** for non-preview secret classes (raw `terminal read` tails without `preview:` lines) remains best-effort; foreign read is denied at the gate first.
+9. **Effect tests do not start an in-process HTTP bridge.** They prove `evaluateCliArgv` returns deny before spawn (server short-circuit at `!policyResult.ok` still present — read, not integration-harnessed this round).
+
