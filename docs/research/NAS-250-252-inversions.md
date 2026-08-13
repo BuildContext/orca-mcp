@@ -1199,3 +1199,142 @@ Run at `a2a715d` via `npm test`. Matches the implementer's 406 → 419 claim. As
 - Did not fuzz every banner variant or `maxBuffer` ceiling on the live CLI.
 
 Attack surface actually covered: mutation of the two differential tests (real file edits, restored); snapshot-vs-live spec/BOOLEAN_FLAGS compare; parseArgs parity vs live `args.js` on 18 inputs; `evaluateCliArgv` tables for the r7 catalogue + `@all`/`@worktree`/`--json=false`/`--ack` non-delivery/`computer --id task_*`/value-typed over-match/legitimate coordinator argv; isolated `action=cli` spawn + caller payload for inbox, list, deny-show, deny-auto, deny-linear, owned read, `worktree list --repo`, reply `--from` overwrite; unit redaction of show/inbox/human/partial/binary/error/bare-array; independent 419/0 suite.
+
+# Closeout of round-9 findings on `a8d3b42` base (fix author wave)
+
+Branch: `BuildContext/nas-248-ownership-invariant`. No merge, no PR, no main touch.
+Constraint honored: no action=cli redesign, no uid-model change, no new modules/abstractions/config.
+Baseline suite at start of wave (a8d3b42 / a2a715d lineage): **419 pass / 0 fail**.
+After closeout: **427 pass / 0 fail**.
+
+## Items
+
+### Item 1 — group addresses (P0) — FIXED
+
+`evaluateCliArgv` value-typed block (only on `VALUE_TYPED_ONLY`: `to`/`ack`/`retry-of`/`parent`/`resume`):
+
+- any value beginning with `@` that is not `@worktree:…` → **deny** (`unowned_group_address`), including `@all` and unknown `@…` forms.
+- `@worktree:<sel>` → `stripAddressPrefix` then `note('worktree', [sel])` → existing `worktreeOwnershipCheck`. No new resolver.
+- unrecognised non-`@` value on a value-typed address flag (except `--ack`, see Item 5) → **deny** (`unrecognized_address_value`). Null no longer falls through on `--to`.
+
+Argv-proof:
+
+```
+evaluateCliArgv(['orchestration','send','--to','@all','--subject','x'], {admin:true, all-not-owned}) → deny
+evaluateCliArgv(['orchestration','send','--to','@worktree:path:/foreign','--subject','x'], …) → deny (worktree checker)
+evaluateCliArgv(['orchestration','send','--to','term_FOREIGN','--subject','x'], …) → deny (unchanged)
+```
+
+### Item 2 — lock differential on resolver kind — FIXED
+
+New test: `spec differential: target-capable flags are kind=target with a live resolver`.
+
+- Asserts every target-capable flag (`terminal`,`id`,`to`,`ack`,…) has `FLAG_TABLE[name].kind === 'target'` and a non-null `resolver` matching `TARGET_FLAG_RESOLVERS`.
+- Asserts positional promotion into those names keeps `kind==='target'`.
+- Effect-locks `automations show auto_FOREIGN` → deny via id resolver.
+
+`CLI_COMMAND_SPECS` deduped **469 → 228** (241 identical duplicates removed). Still pinned at `CLI_SPEC_VERSION = "1.4.180"`. Cheap test fails if snapshot has duplicate paths or version ≠ `1.4.180`. **Did not** re-plumb to AppImage at runtime.
+
+#### Mutation re-run (real file edits, restored)
+
+| Mutation | How | Result |
+|----------|-----|--------|
+| MUT1 — new positional | prepend `{path:['synthetic','show'], positionalArgs:['secretid'], allowedFlags:[…,'secretid']}` | **FAIL** 2/3 differential tests (`unclassified shipped flags: secretid` + positional not in FLAG_TABLE). New target-capable test still green (secretid not target-capable). |
+| MUT2 — new flag, no resolver | prepend `{path:['synthetic','run'], allowedFlags:[…,'nonesuch-flag']}` | **FAIL** 1/3 (flag-table classification). |
+| MUT3 — remove id resolver | delete `id: 'id'` from `TARGET_FLAG_RESOLVERS`; add `'id'` to `NON_TARGET_FLAGS` | **FAIL** 1/3 — new target-capable test. Then `evaluateCliArgv(['automations','show','auto_FOREIGN'])` → `allow_with_warning` (proves the demotion reopens the class; the test now catches it). |
+
+All three mutations FAIL. MUT3 is no longer decoration.
+
+### Item 3 — delete fallback rewriter — FIXED
+
+Deleted the body of `redactTerminalListHumanStdout` (regex set + typo `/:s*"/`). Stub returns `UNWALKABLE_OUTPUT_NOTE`.
+
+`applyOwnershipListRedaction`:
+
+- walks `envelope` structurally (unchanged happy path; force---`--json` still the production path).
+- JSON-parseable stdout/stderr → `redactOwnershipContent` walk.
+- unparseable / truncated / binary / non-UTF8 / human text / stderr noise → **withhold** body, keep exit `code`, set `output_withheld=true`. No regex rewrite.
+
+Legitimate owned JSON/envelope responses still walk. Human-only bodies are withheld rather than half-redacted.
+
+### Item 4 — stop scanning content flags — FIXED
+
+Value-typed scan now runs **only** on `VALUE_TYPED_ONLY` address flags. Content flags (`body`,`text`,`subject`,`payload`,`spec`,`prompt`,`message`, siblings in `NON_TARGET_FLAGS`) are not value-scanned.
+
+False denies gone:
+
+- `orchestration reply --id msg_own --body term_FOREIGN` → allow (gate; pin still overwrites `--from` on spawn)
+- `terminal send --terminal term_own --text term_FOREIGN` → allow when handle owned
+- `send --subject/--payload term_FOREIGN` / `--dispatch-capability ctx_FOREIGN` → allow when `--to` owned
+- `linear issue NAS-252` → not ownership-denied
+
+Address flags were not loosened.
+
+### Item 5 — `--id` / `--ack` value rule — FIXED
+
+Removed the command-based `computer permissions` exception (`isComputerPerms` delete-id-and-continue).
+
+`--id` name-based collection keeps only values whose `classifyValueOwnershipKind` is non-null (orch grammar: `task_`/`run_`/`ctx_`/`msg_`/`delivery_`/`auto_`/`art_`/…). 
+
+- `computer permissions --id accessibility` → not a target → allow_with_warning / hardening allowlist (unchanged non-ownership path)
+- `computer permissions --id task_FOREIGN` → id target → deny
+- `linear issue NAS-252` → null grammar → not a target → allow (not ownership-deny)
+- `automations show auto_FOREIGN` / `artifacts delete art_x` → id grammar → deny
+
+`--ack`: value-typed. `delivery_*` / `msg_*` / underscore orch ids classify and resolve (foreign → deny). Values outside recognised grammar (`ack_FOREIGN` matches underscore id → deny; a pure UUID / bare word → not-a-target, continue). Justification: ack tokens that look like orch ids must not skip ownership; tokens that do not name orch objects are not ownership-relevant. Silent allow of `delivery_*`-shaped foreign ids remains impossible.
+
+## Round-9 open items — disposition
+
+| Finding | Disposition |
+|---------|-------------|
+| P0-1 `--to @all` / `@worktree:` | **Fixed** (Item 1) |
+| P1-1 differential MUT3 | **Fixed** (Item 2); MUT3 now fails |
+| P1-2 human/exception output | **Fixed** fail-closed withhold (Item 3); happy-path JSON walk retained |
+| P1-3 computer `--id task_*` / `--ack` | **Fixed** value rule (Item 5) |
+| P2-1 snapshot dups | **Fixed** dedupe + version test (Item 2) |
+| P2-1 `--json=false` semantic drift | **Refused** this wave — live CLI `flags.has('json')` still treats token as JSON; force-json path remains correct. Not a coordinator break. Named open. |
+| P2-1 `file open /abs` | **Held as author-declared** — bare absolute on `--path` is not a worktree selector. Out of closeout scope. |
+| Regressions 1–2 (linear / content false denies) | **Fixed** (Items 4–5) |
+| HELD 1–21 | **Still hold** — pinned by existing + closeout tests |
+
+## Special-case ledger (honest)
+
+**Removed:**
+
+1. `isComputerPerms` command exception in value-typed loop.
+2. Entire `redactTerminalListHumanStdout` regex rewriter body (contentLine/jsonKey/msgRow/title strip).
+3. Universal value-scan over every flag name (content flags included).
+
+**Added:**
+
+1. `@` / `@worktree:` branch inside existing VALUE_TYPED_ONLY loop (~15 lines).
+2. Orch-grammar filter on `--id` collection (~20 lines).
+3. `tryParseWalkableJson` + withhold diagnostic (~40 lines, replacing ~80 lines of regex).
+4. Two differential assertions + closeout effect tests.
+
+**Net: removed more special cases than added.** No new modules, no new config knobs, no uid changes.
+
+## Mutation / suite evidence
+
+```
+# before (a8d3b42 lineage)
+# tests 419 / pass 419 / fail 0
+
+# after closeout
+# tests 427 / pass 427 / fail 0
+
+MUT1: FAIL (2 differential tests)
+MUT2: FAIL (1 differential test)
+MUT3: FAIL (target-capable resolver test); evaluate → allow_with_warning
+```
+
+## What I could not prove
+
+- Did not re-drive isolated-HOME `action=cli` HTTP spawn for `@all` / withhold path (unit + argv-proof only this wave). Round 9 already proved spawn wiring for pin/force-json/deny; this wave did not regress those helpers and did not re-stand the fake-orca bridge.
+- Did not live-exec `orchestration send --to @all` or foreign `@worktree:` against the shared runtime (boundary).
+- Did not re-prove NAS-249 / NAS-253 bind oracles.
+- Did not flip `ORCA_BRIDGE_CLI_HARDENING`, restart bridge, touch `~/.orca-bridge*`, publish, or bump package version.
+- `--ack` with a pure UUID (no underscore orch grammar) is treated as not-a-target; whether production ever emits non-`delivery_*` ack tokens was not live-proven — same residual as round 9, now explicit.
+- `--json=false` gate-vs-CLI token meaning left open (refused above).
+
+Attack surface covered this wave: Items 1–5 code paths; MUT1/2/3 on real files; full `npm test` 427/0; closeout effect tests for group addresses, content-flag allow, computer id value rule, linear allow, HELD smoke.
