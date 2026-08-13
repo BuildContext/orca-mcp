@@ -1769,3 +1769,219 @@ HELD 1–21 unit smoke paths in existing tests still pass under the full suite.
 
 The previous closeout claimed mutations were locked while MUT4b stayed green because the assertion was a weaker name list. This wave makes the differential assert `deriveRequiredAddressFlags` (handler map ∪ non-content positionals) and re-ran MUT1–MUT4b on the real files. MUT4b now fails. If a reviewer invents a flag-only content-named address without a positional and without a handler-map entry, say so — that residual is documented above, not papered over.
 
+
+
+# Adversarial review of `5cd47fd` — round 12 (r11 closeout)
+
+**Worktree:** `/home/orca/orca/workspaces/orca-mcp/nas248-round12-adv`  
+**Target:** `BuildContext/nas-248-ownership-invariant` @ `5cd47fd` (`fix(nas-252): gate --workspace via worktreeOwnershipCheck; derive address flags`)  
+**Role:** adversarial reviewer. Zero prior review of this commit. Author claims MUT1–MUT4b all FAIL and suite 434/0.  
+**Live contour:** READ-ONLY. Mutations and bridge drives used unit files (restored) and isolated HOME only (`/tmp/nas-252-r12-iso/home`). No bridge restart, no npm publish, no `ORCA_BRIDGE_CLI_HARDENING` flip, no writes to live `~/.orca-bridge*` / sender pins.
+
+## VERDICT
+
+**DIRTY — do not merge to main as-is.**
+
+Not because r10 P0-1 (`--workspace`) is still open — it is closed on the production `action=cli` spawn path and on `evaluateCliArgv` (hard on and off). The r11 two-item closeout did what it claimed for those two items.
+
+DIRTY because:
+
+1. **MUT6 (new class: collection-path decoupling)** leaves the differential lock green while reopening the exact r10 P0 for `--workspace`. Effect-lock tests catch this particular spelling; the differential does not. This is the next level after flag classification: tables say target, evaluate never notes the value.
+2. **Author residual (a) is real and worse than “honest footnote”:** flag-only content-named address (`--recipient` in `allowedFlags` only, `NON_TARGET`, no positional, no handler-map entry) → differential **PASS 3/3**, evaluate → `allow_with_warning`. Reachable from `action=cli` as soon as any shipped handler/spec grows that shape without a handler-map edit.
+3. **Author residual (b) is real and spawn-proven:** `file open path:/foreign` (and bare `/abs`) still **allow** and **spawn** on isolated `action=cli`. Declared out of r11 scope; still an open r10 P1-2 hole on the coordinator path.
+4. Author honesty is mostly accurate on MUT1–4b and 434/0; the overclaim is the implied strength of the lock (“handler usage derivation”) vs what the differential actually binds (map equality + kinds, not collection/dispatch).
+
+HELD 1–21 *as written*, r10 closed holes on `--to @all` / `@worktree:` / foreign terminal / automations show / release foreign, and the r11 `--workspace` gate itself all re-probed green on unit + isolated spawn.
+
+## Suite count (independent)
+
+```
+# tests 434
+# suites 87
+# pass 434
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 1036.088079
+```
+
+Command: `npm test` at `5cd47fd` in this worktree. Matches author 434/0. Not evidence the inversion holds.
+
+Post-mutation restore md5:
+
+- `lib/cli-policy.mjs` = `632e861e6d4bb79e1fb2a6e6ce85ab17`
+- `lib/cli-argv-normalize.mjs` = `02465e10f39bd3a15775b190754cc16d`  
+(before == after; `git status` clean after mutations)
+
+## Mutation re-run (REAL files, not fixtures)
+
+Script: `/tmp/nas-252-r12-mutation.sh` (pattern `spec differential`, 3 tests). Baseline: **PASS 3/0**.
+
+| Mutation | How | Differential | Evaluate / effect | Teeth? |
+|----------|-----|--------------|-------------------|--------|
+| **MUT1** new positional `secretid` | prepend synthetic spec with `positionalArgs:['secretid']` | **FAIL** 0/3 (`unclassified shipped flags: secretid`; positional not in FLAG_TABLE; missing derived address) | n/a | Yes |
+| **MUT2** new flag no resolver | prepend synthetic spec `allowedFlags:[…,'nonesuch-flag']` | **FAIL** 2/3 / 1 fail (unclassified `nonesuch-flag`) | n/a | Yes |
+| **MUT3** demote `id` | remove `id` from `HANDLER_ADDRESS_FLAG_RESOLVERS`; add `'id'` to `NON_TARGET_FLAGS` | **FAIL** 2/3 (`TARGET_FLAG_RESOLVERS must equal HANDLER_ADDRESS_FLAG_RESOLVERS`) | `automations show auto_FOREIGN` still **deny** `handle_not_owned` (TARGET map still had `id` in this exact edit shape; deep-equal is the tooth) | Yes on map lock |
+| **MUT4a** demote `--to` | remove first `to: 'handle'` (HANDLER); add `'to'` to NON_TARGET | **FAIL** 2/3 (deep-equal HANDLER vs TARGET) | `--to @all` still **deny** (VALUE_TYPED_ONLY / remaining TARGET entry — defense in depth) | Yes on named flag |
+| **MUT4b** content-named address + positional | `'recipient'` → NON_TARGET; synthetic deliver positional+flag | **FAIL** 2/3 (`--recipient must be kind=target, got non_target`); `deriveRequiredAddressFlags().has('recipient')===true` | evaluate `--recipient term_FOREIGN` / positional → **allow_with_warning** until classified target — lock is the differential, as author said | Yes for *positional* class |
+| **MUT6** (invented) collection-path decoupling | keep HANDLER/TARGET/FLAG_TABLE identical; delete the `else` branch that collects worktree-grammar values for `resolver==='worktree' && name!=='worktree'` (i.e. `--workspace`) | **PASS 3/3** | `automations create --workspace path:/foreign` → **allow_with_warning**; `--worktree path:/foreign` and `--to @worktree:path:/foreign` still **deny**. Effect suite `NAS-252 r11 workspace worktree selector`: **4 pass / 4 fail** (all foreign-workspace effect-locks) | **Differential: no. Effect-lock for this spelling: yes.** |
+
+**Summary: MUT1=FAIL MUT2=FAIL MUT3=FAIL MUT4a=FAIL MUT4b=FAIL; MUT6_DIFF=PASS (effect FAIL).** Files restored; md5 match.
+
+### MUT6 class (next level after flag classification)
+
+Lineage of failure classes: prefixes → flag names → argv tokenisation → value grammars → flag classification → **collection / dispatch path**.
+
+MUT6 does not demote `workspace` in any table. `FLAG_TABLE.workspace` stays `{kind:'target', resolver:'worktree'}`. `deriveRequiredAddressFlags().get('workspace')==='worktree'`. Differential asserts kinds and map equality only. Production `evaluateCliArgv` has a special case:
+
+```js
+if (name === 'worktree') {
+  note('worktree', collectWorktreeSelectorsFromArgv(args));
+} else {
+  // Item 5 pattern … collectFlagValuesFromArgv + classifyValueOwnershipKind
+}
+```
+
+Delete only the `else` body and every non-`--worktree` worktree-class alias (today: `--workspace`) stops entering `worktreeOwnershipCheck` while tests that only stare at tables stay green. The r11 effect-lock tests *do* bind this spelling (4 failures under MUT6). That is real teeth for `--workspace` specifically — not a general lock that any future alias or collection-path drift fails the differential.
+
+Same structural gap as r10 MUT4c2 (always-owned at real `runChecker` call site): differential green, effect test red for the named path only.
+
+## Residual (a) — flag-only MUT4b-class gap
+
+**Author claim:** honest residual; MUT4b closes positional; flag-only content-named address without handler-map entry still needs a map edit.
+
+**Independent check at `5cd47fd`:**
+
+```
+# add 'recipient' to NON_TARGET_FLAGS
+# prepend spec {path:['synthetic','deliver'], allowedFlags:['help','json','recipient','subject']}  # NO positionalArgs
+spec differential → PASS 3/3
+deriveRequiredAddressFlags().has('recipient') === false
+evaluateCliArgv(['synthetic','deliver','--recipient','term_FOREIGN',…], all-checkers-not-owned, hard off)
+  → allow_with_warning ok=true
+```
+
+**Verdict:** residual is **real**. Severity: **P1 lock gap** (not a live shipped bypass today — no v1.4.180 handler exposes an unbound flag-only address under this shape after r11 moved `workspace` onto the handler map). Reachability: any future `allowedFlags` entry that a handler treats as a selector, classified NON_TARGET / omitted from `HANDLER_ADDRESS_FLAG_RESOLVERS`, and not a positional, ships green under the differential and `allow_with_warning` under default hardening-off. Coordinator `action=cli` path. Not theoretical once the next misfile lands; it is exactly how `--workspace` shipped at `a119214`.
+
+## Residual (b) — `file open path:` out of scope
+
+**Author claim:** r10 P1-2 out of the two-item r11 scope; not fixed.
+
+**Independent check:**
+
+| Probe | `evaluateCliArgv` hard off | hard on | Isolated `action=cli` |
+|-------|----------------------------|---------|------------------------|
+| `file open path:/foreign` | allow_with_warning | allowlist deny | **spawned** `['file','open','path:/foreign','--json']`, caller `ok:true` |
+| `file open /abs` | allow_with_warning | allowlist deny | **spawned** |
+| `file open --path path:/foreign` | allow_with_warning | — | (same class) |
+| `environment show --environment path:/foreign` | allow_with_warning | — | (unit only this round) |
+| `project setup-clone --destination path:/foreign` | allow_with_warning | — | (unit only) |
+
+**Verdict:** residual is **real and reachable from coordinator `action=cli`** under default hardening-off. Side effect is foreign filesystem open via CLI, not host-wide inventory dump. Rank stays **P1** (r10): weaker than automations schedule/write, stronger than a pure docs nit. Author correctly did not claim it fixed; merge still carries this hole.
+
+## Round-10 attack catalogue — re-run at `5cd47fd`
+
+Unit: `evaluateCliArgv` hard OFF + ON, all checkers not-owned (unless noted). Isolated: HOME=`/tmp/nas-252-r12-iso/home`, PORT=18814, `ORCA_CLI_COMMAND=fake-orca`, `ORCA_BRIDGE_SENDER_TERMINAL=term_iso_pin`, `ORCA_BRIDGE_SENDER_SHARED=1`, hardening unset. Asserted on spawned argv **and** SSE caller envelope (`content[0].text`).
+
+| Prior finding | evaluate hard off / on | Isolated spawn? | Still closed? |
+|---------------|------------------------|-----------------|---------------|
+| r9/r10 `--to @all` / `@ALL` / `@everyone` | deny / deny | **not spawned**; `cli_policy_denied` / `handle_not_owned` | **Dead** |
+| `--to @worktree` / `@worktree:` / `@worktree:path:/foreign` | deny / deny | **not spawned** | **Dead** |
+| `--to @worktree:path:/own` (owned checker) | allow (owned wt) | n/a (iso checker has no owned wt registry beyond pin path tests) | **Holds** when checker says owned |
+| `terminal show --terminal term_FOREIGN` (space / `=`) | deny / deny | **not spawned** | **Dead** |
+| `terminal stop --worktree path:/foreign` (+ name:) | deny / deny | **not spawned** | **Dead** |
+| `automations show auto_FOREIGN` positional | deny / deny | **not spawned** | **Dead** |
+| `artifacts delete art_FOREIGN` | deny / deny | **not spawned** (unit) | **Dead** |
+| `computer permissions --id task_FOREIGN` | deny / deny | **not spawned** | **Dead** |
+| `computer permissions --id accessibility` | allow_with_warning / allowlist deny | **spawned** | **Fixed** (not ownership-deny) |
+| `linear issue NAS-252` | allow_with_warning / allowlist deny | **spawned** | **Fixed** |
+| `--ack delivery_*` / `ack_FOREIGN` | deny / deny | n/a | **Dead** for orch grammar |
+| `--ack <uuid>` | allow / allow | **spawned** check + pin inject | **P2 residual** (author-declared) |
+| unscoped `worker-list` / `run-list` | deny / deny | **not spawned** | **Dead** |
+| forbidden handoff `worktree create --agent --prompt` | deny / deny | n/a | **Dead** |
+| owned reply/send with token-shaped body | allow | reply spawned; `--from` overwritten to pin | **Holds** |
+| inbox `--json` pin inject + strip | allow path | spawned `inbox --json --terminal term_iso_pin`; foreign row drops subject/body/payload | **Dead on spawn path** |
+| terminal list redaction | allow | foreign row `{handle,connected,writable}` only; owned keeps title/path/preview | **Holds** |
+| `withSender` / `--from` overwrite | n/a | reply `--from term_FOREIGN` → spawned `--from term_iso_pin` | **Holds** |
+| **r10 P0-1 `--workspace path:/foreign` (and name:/branch:/id:/abs)** | **deny / deny** `handle_not_owned` | **not spawned**; caller `cli_policy_denied` | **Closed at 5cd47fd** |
+| owned `--workspace path:/own` | allow_with_warning (checker owned) | iso: deny if checker not-owned (fail-closed) | **Holds** |
+| **r10 P1-2 `file open path:/foreign`** | **allow_with_warning / allowlist deny** | **spawned** | **Still open** |
+| `action=release` foreign dispatch/handle | n/a (release path) | `mode=ownership_denied`, reason `dispatch_not_in_registry` / `handle_not_in_registry`; **no** worker-release/close spawn (only possible NAS-246 `status --json` probe) | **Holds (HELD 11)** |
+
+## Isolated-HOME bridge drive
+
+- Dir: `/tmp/nas-252-r12-iso/` (fake-orca, drive2.mjs, drive2-out.json, spawned-argv2.jsonl).  
+- Server: `node server.mjs --port 18814` with isolated `HOME`, never live uid state.  
+- Results (abbrev): foreign show / @all / @worktree foreign / workspace foreign / auto show / computer task / stop worktree foreign / unscoped worker-list → **deny, empty spawn**. file open path+abs → **spawn**. release foreign dispatch/handle → **ownership_denied**, no teardown spawn. inbox strip and list redaction confirmed on caller JSON. reply spoofed `--from` overwritten.
+
+## Findings (this round)
+
+### P1-1 — differential does not bind collection/dispatch (MUT6)
+
+Tables can claim `workspace→worktree` while evaluate drops alias collection. Differential stays 3/0. Effect-lock suite for `--workspace` fails (good for that name only). Future worktree-class alias or a quiet edit to the `name === 'worktree'` branch is the same shape.
+
+**Repro:** apply MUT6 edit above; `node --test --test-name-pattern 'spec differential'` → pass; `evaluateCliArgv(automations create --workspace path:/foreign)` → allow_with_warning; isolated would spawn (not re-spawned under mutation; unit sufficient with r11 effect tests red).
+
+**Coordinator reachability:** yes, `action=cli`, hardening default off — *if* collection is broken. At clean `5cd47fd` collection works; the finding is lock weakness, not a live bypass on HEAD.
+
+### P1-2 — flag-only address residual (author a) confirmed
+
+See Residual (a). Live bypass: no at HEAD. Lock bypass: yes.
+
+### P1-3 — `file open path:/foreign` still open (author b) confirmed
+
+See Residual (b). Live coordinator bypass: **yes** on isolated spawn at HEAD.
+
+### P2 — prior residuals still present
+
+- `--ack` UUID skips ownership (spawn-proven).  
+- MUT4c2-class always-owned `runChecker` still not differential-bound (not re-mutated; same architecture).  
+- Snapshot pin `CLI_SPEC_VERSION = 1.4.180` still a string pin, not AppImage require.  
+- Owned human stdout withhold still fail-closed (not re-litigated).
+
+## Author claims scorecard at `5cd47fd`
+
+| Claim | Reality |
+|-------|---------|
+| MUT1–MUT4b all FAIL | **True** (re-run on real files). |
+| Suite 434/0 | **True**. |
+| `--workspace` gated via worktreeOwnershipCheck; effect-lock on create/edit | **True** on unit + isolated spawn. |
+| Derivation closes MUT4b positional class | **True**. |
+| Flag-only residual documented | **True** as documentation; residual still open. |
+| `file open path:` out of scope | **True** that it was out of scope; **still a merge-carried P1**. |
+| Implied “lock = targets the gate resolves” | **Overstated.** Lock = handler map ∪ non-content positionals + kind/resolver equality. Does not bind collection path (MUT6) or flag-only names (residual a) or resolver implementation (MUT4c2 class). |
+
+## Named-ticket scorecard
+
+| Ticket | At `5cd47fd` |
+|--------|----------------|
+| NAS-250 foreign terminal preview leak | **Holds** on JSON/`--terminal` deny + list redaction + withhold path. |
+| NAS-251 foreign `--worktree` soft-exec | **Holds** for `--worktree` and `--to @worktree:`. **Holds** for `--workspace` at HEAD. Lock for `--workspace` is effect tests + table, not differential collection binding. |
+| NAS-252 any target selector default-deny, hardening-independent | **Mostly holds** on shipped selectors at HEAD. **Open:** `file open` path-selector grammar (P1); flag-only future misfile class (P1 lock); UUID ack (P2). |
+
+## What this review did not do
+
+- Did not fix MUT6 / file-open / flag-only residual (non-goal unless small+tested; MUT6 fix is small but out of “review only” default — left for author).  
+- Did not touch NAS-249/253 bind oracles.  
+- Did not live-exec foreign automations/worktrees on the shared runtime.  
+- Did not flip live hardening or restart live bridge.  
+- Did not merge / open PR / push main.
+
+## Evidence paths
+
+- Mutations: `/tmp/nas-252-r12/mutation-run.txt`, `mut1..mut6*.txt`, `residual-a.txt`, `md5-*.txt`  
+- Suite: `/tmp/nas-252-r12/suite.txt`  
+- Isolated drive: `/tmp/nas-252-r12-iso/drive2-log.txt`, `drive2-out.json`, `spawned-argv2.jsonl`
+
+## Merge recommendation
+
+Do not treat 434/0 + MUT1–4b FAIL as merge-complete. Minimum before CLEAN:
+
+1. Keep `--workspace` effect-locks (already present).  
+2. Either bind collection for all `resolver==='worktree'` flags without a name hardcode, or add a differential/effect test that fails under MUT6-shaped deletion.  
+3. Decide residual (b): restore deny for `path:` grammar on `file open` / document as accepted product risk with ticket.  
+4. Residual (a): accept with explicit “next misfile will look like r10 workspace” or extend derivation to flag names that handlers mark as selectors (offline list already exists — require every `allowedFlags` entry that appears in a future handler audit).
+
+Until (2) and an explicit (3) decision, **DIRTY**.
+
