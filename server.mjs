@@ -109,7 +109,17 @@ import {
   stateOwnershipWarnings,
   writeFilePreservingOwner,
   resolveTerminalHandleOwnership,
+  resolveDispatchOwnership,
+  resolveWorktreeOwnership,
+  resolveTaskOwnership,
+  resolveRunOwnership,
+  resolveGenericIdOwnership,
+  resolvePageOwnership,
+  resolveRepoOwnership,
+  listOwnedTerminalHandles,
+  applyOwnershipListRedaction,
 } from './lib/state-ownership.mjs';
+import { executeReleaseWorker } from './lib/release-worker.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -159,8 +169,10 @@ const TOOLSET_GATE = createToolsetGate({ env: process.env, argv: process.argv })
 // Opt-in cli allowlist. Default permissive (hardening off).
 // ORCA_BRIDGE_CLI_HARDENING=1 enforces deny-by-default allowlist.
 // Admin unlock follows the effective toolset admin bit (toolset collapse).
-// ownershipCheck closes over live senderCaches / clientOwnership / dispatchRegistry
-// (resolved at call time). client_key comes from requestContext via currentClientKey().
+// ownershipCheck / dispatchOwnershipCheck close over live maps (resolved at
+// call time). client_key comes from requestContext via currentClientKey().
+// NAS-248: ownership is a system invariant independent of the hardening flag.
+// Hardening governs allowlisting only. action=release gates via requireOwned*.
 const CLI_POLICY = createCliPolicy({
   ...resolveCliPolicyConfig(process.env),
   admin: TOOLSET_GATE.admin,
@@ -182,6 +194,66 @@ const CLI_POLICY = createCliPolicy({
       coordinatorHandles,
     },
   ),
+  dispatchOwnershipCheck: (ctx) => resolveDispatchOwnership(
+    ctx.dispatchId,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+    },
+  ),
+  worktreeOwnershipCheck: (ctx) => resolveWorktreeOwnership(
+    ctx.worktree,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+      allowSyntheticCreate: ctx.allowSyntheticCreate === true,
+    },
+  ),
+  taskOwnershipCheck: (ctx) => resolveTaskOwnership(
+    ctx.taskId,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+    },
+  ),
+  runOwnershipCheck: (ctx) => resolveRunOwnership(
+    ctx.runId,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+    },
+  ),
+  idOwnershipCheck: (ctx) => resolveGenericIdOwnership(
+    ctx.id,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+    },
+  ),
+  pageOwnershipCheck: (ctx) => resolvePageOwnership(
+    ctx.pageId,
+    currentClientKey(),
+    {},
+  ),
+  repoOwnershipCheck: (ctx) => resolveRepoOwnership(
+    ctx.repo,
+    currentClientKey(),
+    {},
+  ),
+  parentWorktreeOwnershipCheck: (ctx) => resolveWorktreeOwnership(
+    ctx.worktree,
+    currentClientKey(),
+    {
+      dispatchRegistry,
+      clientOwnership,
+      allowSyntheticCreate: false,
+    },
+  ),
 });
 const SENDER_CACHE_TTL_MS = 15_000;
 // ORCH_FROM_CMDS, CHECK_WAIT_*, DEFAULT_WAIT_TYPES imported from security-core.mjs
@@ -200,6 +272,9 @@ const coordinatorHandles = new Set();
  * Per-client ownership for mailbox filtering + run binding.
  * boundRunId/boundSender: last successful run-use for this client pin.
  * Skipping redundant run-use preserves consumer_generation so ack works (0.2.13).
+ *
+ * NAS-248 P0 #4: dispatch/terminal ownership is established only at dispatch
+ * (or hydrate from durable store). await/check must never claim a dispatchId.
  * @type {Map<string, { runs: Set<string>, dispatches: Set<string>, workerHandles: Set<string>, boundRunId: string|null, boundSender: string|null }>}
  */
 const clientOwnership = new Map();
@@ -215,6 +290,7 @@ function ownershipFor(clientKey) {
       runs: new Set(),
       dispatches: new Set(),
       workerHandles: new Set(),
+      tasks: new Set(),
       boundRunId: null,
       boundSender: null,
     };
@@ -223,11 +299,20 @@ function ownershipFor(clientKey) {
   return reg;
 }
 
-function registerOwnedDispatch({ runId, dispatchId, terminalHandle } = {}) {
-  const reg = ownershipFor(currentClientKey());
+/**
+ * Record in-memory ownership bits for a client.
+ * When `clientKey` is omitted, uses the active request client.
+ * runId-only calls (await/check rebind) do NOT claim dispatch ownership.
+ */
+function registerOwnedDispatch({ runId, dispatchId, terminalHandle, taskId, clientKey } = {}) {
+  const reg = ownershipFor(clientKey || currentClientKey());
   if (runId) reg.runs.add(String(runId));
   if (dispatchId) reg.dispatches.add(String(dispatchId));
   if (terminalHandle) reg.workerHandles.add(String(terminalHandle));
+  if (taskId) {
+    if (!reg.tasks) reg.tasks = new Set();
+    reg.tasks.add(String(taskId));
+  }
 }
 
 function rememberCoordinatorHandle(handle) {
@@ -310,6 +395,145 @@ const AUDIT_DIR = (process.env.ORCA_BRIDGE_AUDIT_DIR || '').trim()
   || path.join(os.homedir(), '.orca-bridge');
 const auditLog = createAuditLog({ dir: AUDIT_DIR });
 const dispatchRegistry = createDispatchRegistry();
+
+/**
+ * Durable dispatch ownership bindings (NAS-248 P0 #4).
+ * Survives bridge process restart so coordinators can still release workers they
+ * legitimately dispatched. Never written from await/check claim paths — only from
+ * dispatch-time bindOwner / hydrate. Not keyed on runtimeId.
+ */
+const OWNERSHIP_STORE = path.join(AUDIT_DIR, 'dispatch-ownership.json');
+
+function persistOwnershipBindings() {
+  try {
+    if (!fs.existsSync(AUDIT_DIR)) {
+      fs.mkdirSync(AUDIT_DIR, { recursive: true, mode: 0o700 });
+    }
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      bindings: dispatchRegistry.listOwnershipBindings(),
+    };
+    const res = writeFilePreservingOwner(
+      OWNERSHIP_STORE,
+      JSON.stringify(payload, null, 2),
+      { mode: STATE_FILE_MODE },
+    );
+    if (res.chownError) {
+      console.error(
+        `WARN: ownership store owner not restored (${res.chownError}); ` +
+          `chown it back to the service user or release-after-restart will fail closed`,
+      );
+    }
+  } catch (e) {
+    console.error('WARN: cannot persist dispatch ownership:', e.message);
+  }
+}
+
+/**
+ * Hydrate registry + clientOwnership from durable bindings after process restart.
+ * bindOwner refuses reassignment — first writer wins.
+ */
+function loadPersistedOwnership() {
+  try {
+    if (!fs.existsSync(OWNERSHIP_STORE)) return 0;
+    const raw = JSON.parse(fs.readFileSync(OWNERSHIP_STORE, 'utf8'));
+    const bindings = Array.isArray(raw?.bindings)
+      ? raw.bindings
+      : Array.isArray(raw)
+        ? raw
+        : [];
+    let n = 0;
+    for (const b of bindings) {
+      if (!b || typeof b !== 'object') continue;
+      const dispatchId = b.dispatchId != null ? String(b.dispatchId).trim() : '';
+      const clientKey = b.clientKey != null ? String(b.clientKey).trim() : '';
+      if (!dispatchId || !clientKey) continue;
+      const bound = dispatchRegistry.bindOwner(dispatchId, {
+        status: b.status || 'running',
+        runId: b.runId || null,
+        taskId: b.taskId || null,
+        terminalHandle: b.terminalHandle || null,
+        clientKey,
+        agent: b.agent || null,
+        worktree: b.worktree || null,
+        name: b.name || null,
+        dispatchedAt: b.dispatchedAt || null,
+        lastActivityAt: b.lastActivityAt || b.dispatchedAt || null,
+        source: 'persisted',
+      });
+      if (!bound.ok) continue;
+      registerOwnedDispatch({
+        runId: b.runId || null,
+        dispatchId,
+        terminalHandle: b.terminalHandle || null,
+        taskId: b.taskId || null,
+        clientKey,
+      });
+      n += 1;
+    }
+    return n;
+  } catch (e) {
+    console.error('WARN: cannot load dispatch ownership:', e.message);
+    return 0;
+  }
+}
+
+/**
+ * Authoritative dispatch-time ownership bind + durable persist.
+ * The only path that may create a clientKey binding for a dispatch id.
+ */
+function bindOwnedDispatch({
+  runId,
+  dispatchId,
+  terminalHandle,
+  taskId,
+  status = 'running',
+  agent = null,
+  worktree = null,
+  name = null,
+  clientKey,
+  extra = {},
+} = {}) {
+  const ck = clientKey || currentClientKey();
+  const id = dispatchId != null ? String(dispatchId).trim() : '';
+  if (!id) {
+    // No dispatch id yet — track run/handle/task only (not a claimable ownership row).
+    registerOwnedDispatch({ runId, terminalHandle, taskId, clientKey: ck });
+    return { ok: true, claimed: false };
+  }
+  const bound = dispatchRegistry.bindOwner(id, {
+    status,
+    runId: runId || null,
+    taskId: taskId || null,
+    terminalHandle: terminalHandle || null,
+    clientKey: ck,
+    agent,
+    worktree,
+    name,
+    dispatchedAt: extra.dispatchedAt || new Date().toISOString(),
+    lastActivityAt: extra.lastActivityAt || new Date().toISOString(),
+    emptyWindowsConsecutive: 0,
+    ...extra,
+  });
+  if (!bound.ok) {
+    return bound;
+  }
+  registerOwnedDispatch({
+    runId,
+    dispatchId: id,
+    terminalHandle,
+    taskId,
+    clientKey: ck,
+  });
+  persistOwnershipBindings();
+  return bound;
+}
+
+const _ownershipHydrated = loadPersistedOwnership();
+if (_ownershipHydrated > 0) {
+  console.error(`orca-bridge: restored ${_ownershipHydrated} durable dispatch ownership binding(s)`);
+}
 
 /** Marker so we do not double-append the worker_done contract to specs. */
 const WORKER_CONTRACT_MARKER = '<!-- orca-bridge-worker-contract -->';
@@ -539,6 +763,54 @@ function describeRun(run, wantJson) {
   out.stderr = tail(run.stderr);
   return out;
 }
+
+/** True when argv requests JSON (`--json`, `--json=true`, `--json=`). */
+function argvWantsJson(args) {
+  if (!Array.isArray(args)) return false;
+  for (const a of args) {
+    const tok = String(a);
+    if (tok === '--json') return true;
+    if (tok.startsWith('--json=')) return true;
+  }
+  return false;
+}
+
+/**
+ * NAS-252 output parity: human stdout cannot be structurally walked.
+ * Inject --json on spawn for commands whose responses may carry foreign content
+ * so applyOwnershipListRedaction always sees an envelope/JSON body.
+ */
+function ensureWalkableCliArgv(args) {
+  if (!Array.isArray(args)) return args;
+  if (argvWantsJson(args)) return args;
+  return [...args, '--json'];
+}
+
+
+/**
+ * NAS-248/250: strip foreign PTY content from action=cli responses.
+ * Recursive content-key redaction (preview/scrollback/…) on any node whose
+ * terminal handle is not proven owned. Mutates `described` in place.
+ * Never call from runJson internals (resolveSenderTerminal needs full inventory).
+ *
+ * @param {object} described
+ * @param {string[]} [_args] retained for call-site compatibility; ignored
+ * @param {Iterable<string>|Set<string>} [ownedHandles]
+ */
+function applyCliOwnershipRedaction(described, _args, ownedHandles) {
+  if (!described || typeof described !== 'object') return described;
+  const owned =
+    ownedHandles ??
+    listOwnedTerminalHandles(currentClientKey(), {
+      dispatchRegistry,
+      clientOwnership,
+      senderCaches,
+      coordinatorHandles,
+    });
+  return applyOwnershipListRedaction(described, owned);
+}
+
+
 
 /**
  * Lazy runtime/version gate for dispatch/await/release (NAS-246).
@@ -1017,7 +1289,8 @@ async function withSender(argv) {
   if (argv[0] !== 'orchestration') return argv;
   const sub = argv[1];
   const needsFrom = ORCH_FROM_CMDS.has(sub);
-  const needsTerminal = sub === 'check';
+  // NAS-252 r7 P0: inbox must hit the same pin path as check (spawn path, not just helper).
+  const needsTerminal = sub === 'check' || sub === 'inbox';
   if (!needsFrom && !needsTerminal) return argv;
 
   const sender = await resolveSenderTerminal();
@@ -1031,7 +1304,7 @@ async function runJson(argv, { timeoutMs, cwd, injectSender = true } = {}) {
       finalArgv = await withSender(argv);
     } catch (e) {
       const sub = argv[1];
-      if (ORCH_FROM_CMDS.has(sub) || sub === 'check') {
+      if (ORCH_FROM_CMDS.has(sub) || sub === 'check' || sub === 'inbox') {
         return {
           ok: false,
           envelope: {
@@ -1455,27 +1728,18 @@ async function dispatchWorker(args = {}) {
     }
   }
 
-  // Track ownership so await never suggests release on another coordinator's worker.
-  registerOwnedDispatch({
+  // Authoritative ownership bind at dispatch-time only (NAS-248 P0 #4).
+  // await/check must never create or reassign clientKey bindings.
+  bindOwnedDispatch({
     runId,
     dispatchId: dispatchId || null,
     terminalHandle: handle,
+    taskId,
+    status: 'running',
+    agent,
+    worktree: worktreePath || null,
+    name: name || null,
   });
-  if (dispatchId) {
-    dispatchRegistry.upsert(dispatchId, {
-      status: 'running',
-      runId,
-      taskId,
-      terminalHandle: handle,
-      clientKey: currentClientKey(),
-      agent,
-      worktree: worktreePath || null,
-      name: name || null,
-      dispatchedAt: new Date().toISOString(),
-      lastActivityAt: new Date().toISOString(),
-      emptyWindowsConsecutive: 0,
-    });
-  }
 
 
   return {
@@ -1520,8 +1784,8 @@ async function awaitDispatch(args = {}) {
   const types = String(args.types || DEFAULT_WAIT_TYPES).trim() || DEFAULT_WAIT_TYPES;
 
   // Pin first — check --terminal and run-use --from must be the same durable handle.
+  // NAS-248 P0 #4: do NOT registerOwnedDispatch on await — reads never claim ownership.
   const sender = await resolveSenderTerminal();
-  registerOwnedDispatch({ runId });
 
   /**
    * Mechanism B (0.2.13):
@@ -1775,6 +2039,8 @@ async function awaitDispatch(args = {}) {
   }
 
   // Surface dispatch status + redacted transcript snippets via resources.
+  // NAS-248 P0 #4: never bind/claim clientKey here. Only update rows already
+  // owned by this client (partitionMailbox is fail-closed; this is defense in depth).
   for (const m of messages) {
     const did =
       pick(m, 'dispatchId', 'dispatch_id') ||
@@ -1782,11 +2048,15 @@ async function awaitDispatch(args = {}) {
       summary.worker_done?.dispatchId ||
       null;
     if (!did) continue;
+    const didStr = String(did);
+    if (!owned.has(didStr)) continue;
+    const existing = dispatchRegistry.get(didStr);
+    // No claim-on-read for unbound or foreign ids.
+    if (!existing?.clientKey || String(existing.clientKey) !== ck) continue;
     const t = msgType(m);
-    dispatchRegistry.upsert(did, {
+    dispatchRegistry.upsert(didStr, {
       status: t === 'worker_done' ? 'worker_done' : (t || 'message'),
       runId,
-      clientKey: ck,
       lastDeliveryId: deliveryId || null,
       lastMessageType: t || null,
       lastActivityAt: new Date().toISOString(),
@@ -1799,31 +2069,38 @@ async function awaitDispatch(args = {}) {
     } catch {
       body = String(m?.body || '');
     }
-    dispatchRegistry.appendTranscript(did, {
+    dispatchRegistry.appendTranscript(didStr, {
       type: t || 'message',
       body: String(redactValue(body, 'body')).slice(0, 4000),
       deliveryId: deliveryId || pick(m, 'deliveryId', 'delivery_id') || null,
     });
   }
   if (summary.worker_done?.dispatchId) {
-    dispatchRegistry.upsert(summary.worker_done.dispatchId, {
-      status: 'worker_done',
-      runId,
-      clientKey: ck,
-      outcome: summary.worker_done.outcome || null,
-      taskId: summary.worker_done.taskId || null,
-      lastActivityAt: new Date().toISOString(),
-      emptyWindowsConsecutive: 0,
-    });
+    const didStr = String(summary.worker_done.dispatchId);
+    if (owned.has(didStr)) {
+      const existing = dispatchRegistry.get(didStr);
+      if (existing?.clientKey && String(existing.clientKey) === ck) {
+        dispatchRegistry.upsert(didStr, {
+          status: 'worker_done',
+          runId,
+          outcome: summary.worker_done.outcome || null,
+          taskId: summary.worker_done.taskId || null,
+          lastActivityAt: new Date().toISOString(),
+          emptyWindowsConsecutive: 0,
+        });
+      }
+    }
   } else if (primaryEntry?.dispatchId && empty) {
     // Advance empty-window counter + activity on the tracked worker.
-    dispatchRegistry.upsert(primaryEntry.dispatchId, {
-      emptyWindowsConsecutive,
-      lastActivityAt: lastActivityAt || primaryEntry.lastActivityAt || null,
-      liveness: livenessInfo.liveness,
-      clientKey: ck,
-      runId,
-    });
+    const didStr = String(primaryEntry.dispatchId);
+    if (owned.has(didStr) && primaryEntry.clientKey && String(primaryEntry.clientKey) === ck) {
+      dispatchRegistry.upsert(didStr, {
+        emptyWindowsConsecutive,
+        lastActivityAt: lastActivityAt || primaryEntry.lastActivityAt || null,
+        liveness: livenessInfo.liveness,
+        runId,
+      });
+    }
   }
 
   return {
@@ -1859,136 +2136,27 @@ async function releaseWorker(args = {}) {
   } catch (e) {
     return runtimeGuardRejection(e);
   }
-  const dispatchId = String(args.dispatch_id || '').trim();
-  const handleHint = String(args.terminal_handle || args.handle || '').trim();
-  if (!dispatchId && !handleHint) throw new Error('dispatch_id (or terminal handle) is required');
-
-
-  // Inject-path (bridge default): after worker_done the Dispatch is already completed
-  // and worker-release often returns dispatch_not_found. That is expected — cleanup is
-  // terminal close --tab using the handle from dispatch. Prefer handle when provided.
-  let handle = handleHint;
-  if (!handle && dispatchId) {
-    for (const argv of [
-      ['orchestration', 'dispatch-show', '--task', String(args.task_id || ''), '--json'],
-      ['orchestration', 'worker-show', '--dispatch', dispatchId, '--json'],
-    ]) {
-      if (argv.includes('--task') && !args.task_id) continue;
-      const show = await runJson(argv, { timeoutMs: 30_000 });
-      if (!envOk(show)) continue;
-      const r = show.envelope?.result || {};
-      handle =
-        pick(r.dispatch, 'assignee_handle') ||
-        pick(r.worker, 'agent_terminal_handle', 'agentTerminalHandle') ||
-        pick(r, 'assignee_handle', 'handle') ||
-        '';
-      if (handle) break;
-    }
-  }
-
-  // Optional worker-release (worker-start path only). Never treat dispatch_not_found as hard fail.
-  let releaseRes = null;
-  let releaseNote = null;
-  if (dispatchId) {
-    releaseRes = await runJson(
-      ['orchestration', 'worker-release', '--dispatch', dispatchId, '--json'],
-      { timeoutMs: 60_000 },
-    );
-    if (envOk(releaseRes) || releaseRes?.ok === true) {
-      if (dispatchId) {
-        dispatchRegistry.upsert(dispatchId, {
-          status: 'released',
-          mode: 'worker-release',
-          clientKey: currentClientKey(),
-          terminalHandle: handle || null,
-        });
-      }
-      return {
-        ok: true,
-        mode: 'worker-release',
-        dispatch_id: dispatchId,
-        terminal_handle: handle || null,
-        result: releaseRes.envelope?.result ?? releaseRes,
-        next: {
-          action: 'ack_and_finish',
-          detail: 'worker-release ok (supervised worker-start path). Ack delivery if needed.',
-        },
-      };
-    }
-    const code = releaseRes?.envelope?.error?.code || releaseRes?.error?.code || '';
-    releaseNote =
-      code === 'dispatch_not_found'
-        ? 'worker-release: dispatch_not_found (normal for inject-path after worker_done)'
-        : `worker-release failed: ${code || 'unknown'} — falling back to terminal close`;
-  }
-
-  if (!handle) {
-    return {
-      ok: false,
-      mode: 'none',
-      dispatch_id: dispatchId || null,
-      worker_release: releaseRes?.envelope || releaseRes,
-      error: 'no terminal handle to close; pass terminalHandle from dispatch response',
-      note: releaseNote,
-      next: {
-        action: 'manual',
-        detail: 'Pass terminalHandle from dispatch.terminal_handle, then release again.',
-      },
-    };
-  }
-
-  // Mechanism B: never close the durable coordinator sender tab.
-  // Closing it fences the run (coordinator_handle gone) before ack can complete.
-  if (releaseRefusesCoordinator(handle, coordinatorHandles)) {
-    return {
-      ok: false,
-      mode: 'refused_coordinator_terminal',
-      dispatch_id: dispatchId || null,
-      terminal_handle: handle,
-      error:
-        'terminalHandle is a bridge coordinator sender — will not close (would fence the run). ' +
-        'Pass the worker terminal_handle from the dispatch response, not the sender from health.',
-      note: releaseNote,
-      worker_release: releaseRes?.envelope || releaseRes || null,
-      next: {
-        action: 'release_with_worker_handle',
-        detail:
-          'Use terminal_handle from action=dispatch (worker tab). Coordinator tabs stay open for run-use/await/ack.',
-      },
-    };
-  }
-
-  const closeRes = await runJson(
-    ['terminal', 'close', '--terminal', handle, '--tab', '--json'],
-    { timeoutMs: 30_000 },
-  );
-  const closed = envOk(closeRes) || closeRes.ok === true;
-  if (dispatchId) {
-    dispatchRegistry.upsert(dispatchId, {
-      status: closed ? 'released' : 'release_failed',
-      mode: 'terminal-close',
-      clientKey: currentClientKey(),
-      terminalHandle: handle,
-    });
-  }
-
-  return {
-    ok: closed,
-    mode: 'terminal-close',
-    expected_for_inject_path: true,
-    dispatch_id: dispatchId || null,
-    terminal_handle: handle,
-    note: releaseNote,
-    worker_release: releaseRes?.envelope || releaseRes || null,
-    result: closeRes.envelope?.result ?? closeRes,
-    next: {
-      action: 'ack_and_finish',
-      detail:
-        'Inject-path cleanup = terminal close --tab (worker-release N/A after settle). ' +
-        'Ack mailbox if needed, then report. Not a failure when mode=terminal-close and ok=true.',
-    },
+  // NAS-248 / NAS-202: ownership of dispatchId AND handle is judged BEFORE any
+  // effect (lookup, worker-release, close). executeReleaseWorker enforces that
+  // ordering; this wrapper only supplies live deps + I/O.
+  const ownershipDeps = {
+    dispatchRegistry,
+    clientOwnership,
+    senderCaches,
+    coordinatorHandles,
   };
+  return executeReleaseWorker(args, {
+    clientKey: currentClientKey(),
+    ownershipDeps,
+    runJson,
+    envOk,
+    pick,
+    releaseRefusesCoordinator,
+    coordinatorHandles,
+    upsertDispatch: (id, row) => dispatchRegistry.upsert(id, row),
+  });
 }
+
 
 // --- MCP tools ---------------------------------------------------------------
 // Hyperagent custom MCP currently exports only ONE action from this server
@@ -2308,9 +2476,9 @@ async function callToolUnlocked(op, a) {
     if (waitMs > 0) argv.push('--wait', '--timeout-ms', String(waitMs));
     argv.push('--json');
     // Rebind only when not already bound (same rule as await — preserve ack generation).
+    // NAS-248 P0 #4: check must not registerOwnedDispatch / claim ownership.
     if (a.runId) {
       const rid = String(a.runId);
-      registerOwnedDispatch({ runId: rid });
       const sender = await resolveSenderTerminal();
       if (!isRunBound(rid, sender.handle)) {
         const useRes = await runJson(
@@ -2383,7 +2551,7 @@ async function callToolUnlocked(op, a) {
       argv = await withSender(a.args);
     } catch (e) {
       const sub = a.args[0] === 'orchestration' ? a.args[1] : null;
-      if (ORCH_FROM_CMDS.has(sub) || sub === 'check') {
+      if (ORCH_FROM_CMDS.has(sub) || sub === 'check' || sub === 'inbox') {
         return {
           ok: false,
           error: 'no_sender_terminal',
@@ -2392,8 +2560,13 @@ async function callToolUnlocked(op, a) {
         };
       }
     }
+    // Output parity: always spawn walkable JSON so redaction is never a no-op.
+    argv = ensureWalkableCliArgv(argv);
     const run = await runOrca(argv, { timeoutMs: a.timeoutMs, cwd: a.cwd });
-    const described = describeRun(run, a.args.includes('--json'));
+    const described = describeRun(run, true);
+    // NAS-248: redact foreign scrollback by RESPONSE SHAPE, not argv spelling.
+    // Internal runJson (resolveSenderTerminal) is unredacted on purpose.
+    applyCliOwnershipRedaction(described, a.args);
     // NAS-239 dual-route: non-question reply → also send to dispatch:<id>.
     if (
       a.args[0] === 'orchestration' &&
@@ -3022,7 +3195,7 @@ const server = http.createServer(async (req, res) => {
  * worth one noisy line at boot. See docs/design.md#state-file-ownership.
  */
 function logStateOwnershipWarnings() {
-  const warnings = stateOwnershipWarnings([TOKEN_STORE, SENDER_PIN_STORE, AUDIT_DIR]);
+  const warnings = stateOwnershipWarnings([TOKEN_STORE, SENDER_PIN_STORE, OWNERSHIP_STORE, AUDIT_DIR]);
   for (const w of warnings) log(`WARN: ${w}`);
   return warnings.length;
 }
