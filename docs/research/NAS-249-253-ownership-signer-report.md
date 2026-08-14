@@ -1,7 +1,8 @@
 # NAS-249 / NAS-253 — separate-uid store signer
 
 **Branch:** `BuildContext/nas-249-253-ownership-signer`  
-**SHA:** `95cfec3a9a9e25e709467cb3430672e56d7f36ef`  
+**Code SHA:** `95cfec3a9a9e25e709467cb3430672e56d7f36ef` (signer implementation)
+**Docs tip:** this file is committed on the same branch after the code SHA; branch HEAD is the tip containing both code and this report.  
 **Parent (pre-fix):** `5ab2488aa69230bdeafc9f1671b8ea4ccaa3a9f0`
 
 ## What shipped
