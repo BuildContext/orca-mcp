@@ -41,7 +41,139 @@ Every finding in the NAS-248 line reduces to single-uid trust: the worker *is* t
 - **No shared unix group** between bridge and worker for secret paths. Repo/worktree access via **ACLs** on tree roots, not a shared group.
 - **Runtime token** (`~/.config/orca/orca-runtime.json`, daemon token) stays 0600 bridge-owned. Workers do not get it. Coordinator inject/release/terminal ops run inside the bridge (bridge uid) and keep working. Worker→mailbox signals use a bridge-minted **HMAC capability** (`ORCA_WORKER_CAPABILITY`); full capability→runtime relay is part of attended cutover.
 
-## Linux VM cutover (attended)
+## Linux VM cutover (attended) — 0.3.2 full order
+
+This is the **owner-attended** path from a live 0.3.0 host (unsigned pin /
+ownership stores) onto the merged 0.3.2 tree (signed stores + optional worker
+uid). Do **not** weaken runtime load: unsigned stays rejected until the
+migrator runs.
+
+### Order (do not reorder past the stop/migrate fence)
+
+| Step | Action | Bridge must be stopped? |
+| --- | --- | --- |
+| 1 | Install + start **store-signer** unit | No |
+| 2 | **Stop** old bridge (`orca-bridge.service`) | **Yes — stay stopped through step 5** |
+| 3 | Migrator **dry-run** (bridge uid) | **Yes** |
+| 4 | Migrator **apply** (bridge uid) | **Yes** |
+| 5 | Install 0.3.2 tree / unit files | **Yes** |
+| 6 | Optional: set `ORCA_BRIDGE_WORKER_ISOLATION=1` (+ worker install) | **Yes** |
+| 7 | Start bridge | starting here |
+| 8 | Verify health | No (running) |
+
+`ORCA_BRIDGE_CLI_HARDENING` needs **no** explicit setting: NAS-227 made exact-form
+allowlist **default-on in code** (`0`/`false`/`off` only to disable).
+
+### Why stop before migrate (C5)
+
+Bare unsigned 0.3.0 JSON has **no MAC**. The migrator will sign whatever bare
+payload is on disk. Already-signed envelopes with a bad/foreign signature are
+**refused** (not overwritten). Residual risk is a concurrent same-uid write
+racing read→sign→write — so migration runs only with the **bridge stopped**.
+
+### Commands
+
+1. **Install and start the signer unit** (bridge may still be the old process):
+   ```bash
+   cd /path/to/orca-mcp   # this release / checkout
+   # ensure orca-bridge-signer user + group exist; install unit from deploy/linux/
+   sudo install -m 644 deploy/linux/orca-bridge-store-signer.service \
+     /etc/systemd/system/orca-bridge-store-signer.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now orca-bridge-store-signer.service
+   sudo systemctl status orca-bridge-store-signer.service --no-pager
+   # socket should exist and be 0660, group orca-bridge-signer:
+   sudo ls -l /run/orca-bridge/store-signer.sock
+   ```
+
+2. **Stop the old bridge** (required before migrate; control plane is down):
+   ```bash
+   sudo systemctl stop orca-bridge.service
+   ```
+
+3. **Migrator dry-run** as the **bridge uid** (reads only; must see would-sign or already-signed/missing):
+   ```bash
+   sudo -u orca -E env \
+     HOME=/home/orca \
+     ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock \
+     node /path/to/orca-mcp/scripts/migrate-store-signatures.mjs --dry-run
+   ```
+
+4. **Migrator apply** (backs up each original to `*.pre-sign-<stamp>.bak`, then signs):
+   ```bash
+   sudo -u orca -E env \
+     HOME=/home/orca \
+     ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock \
+     node /path/to/orca-mcp/scripts/migrate-store-signatures.mjs
+   # safe to re-run: second pass is already-signed no-op
+   ```
+   If the signer socket is down the CLI exits **non-zero** with a clear message
+   (never silent no-op).
+
+5. **Install 0.3.2** tree + bridge unit (still stopped):
+   ```bash
+   # copy/checkout 0.3.2 into /opt/orca-mcp (or your install root)
+   sudo install -m 644 deploy/linux/orca-bridge.service /etc/systemd/system/orca-bridge.service
+   # EnvironmentFile=/etc/orca-mcp/env must include:
+   #   ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock
+   # Bridge unit SupplementaryGroups=orca-bridge-signer (shipped in unit file).
+   sudo systemctl daemon-reload
+   ```
+
+6. **Optional worker isolation (NAS-255)** — still stopped:
+   ```bash
+   sudo ./deploy/linux/install-worker-uid.sh
+   # creates orca-worker, wrappers, sudoers, /etc/orca-mcp/worker-isolation.env
+   openssl rand -hex 32
+   # add to /etc/orca-mcp/env (mode 600):
+   #   ORCA_BRIDGE_WORKER_ISOLATION=1
+   #   ORCA_BRIDGE_WORKER_HMAC_SECRET=<hex>
+   # merge other keys from /etc/orca-mcp/worker-isolation.env
+   setfacl -R -m u:orca-worker:rwx /home/orca/orca/workspaces
+   setfacl -R -d -m u:orca-worker:rwx /home/orca/orca/workspaces
+   # Prove FS denial before enabling:
+   sudo -u orca-worker cat /home/orca/.orca-bridge-tokens.json          # must fail
+   sudo -u orca-worker cat /home/orca/.orca-bridge-sender-pins.json      # must fail
+   sudo -u orca-worker cat /home/orca/.config/orca/orca-runtime.json     # must fail
+   ```
+   Skip this whole step if you are not enabling worker isolation on this cutover.
+
+7. **Start bridge**:
+   ```bash
+   sudo systemctl start orca-bridge.service
+   sudo systemctl status orca-bridge.service --no-pager
+   ```
+
+8. **Verify health** (coordinator / `action=health` verbose):
+   - `versionOk` — bridge reports the installed 0.3.2 tree
+   - `statusProbe.ok`
+   - `senderTerminal.ok` — **proves pins survived**; if this is false after cutover,
+     the migrator did not run or the wrong HOME was migrated
+   - When worker isolation enabled: `isolation.workerUid.enabled === true`,
+     `perDispatchUid === false`
+
+### Migrator invocation (reference)
+
+```bash
+node scripts/migrate-store-signatures.mjs [--dry-run] [--home DIR] [--audit-dir DIR]
+```
+
+Touches **only**:
+
+- `$HOME/.orca-bridge-sender-pins.json`
+- `$ORCA_BRIDGE_AUDIT_DIR/dispatch-ownership.json` (default `$HOME/.orca-bridge/…`)
+
+### Rollback notes
+
+- Store files: restore the `*.pre-sign-*.bak` next to each store, then start the
+  previous bridge build (unsigned load path).
+- Worker isolation alone: set `ORCA_BRIDGE_WORKER_ISOLATION=0` (or remove), restart
+  bridge; leave the `orca-worker` account in place.
+
+## Linux VM — worker-uid-only fragment (bridge already on signed stores)
+
+Use this shorter path only when pins/ownership are **already** signed (migrator
+already applied) and you are enabling NAS-255 later.
 
 1. **Prep (no restart yet)**
    ```bash
