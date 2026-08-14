@@ -23,6 +23,8 @@
 //   ORCA_BRIDGE_SENDER_TERMINAL / ORCA_BRIDGE_FROM — pin headless orchestration sender
 //   ORCA_BRIDGE_SENDER_TITLE — title for auto-created coordinator tab (default orca-bridge-coordinator)
 //   ORCA_BRIDGE_SENDER_SHARED=1 — force all clients onto the env pin (single-tenant; multi-coord OFF)
+//   ORCA_BRIDGE_STORE_SIGNER_SOCKET — unix socket of the separate-uid store signer (NAS-249/253)
+//   ORCA_BRIDGE_STORE_SIGNER_KEY    — in-process HMAC key for tests/isolated HOME only (never production)
 //   HINDSIGHT_URL      — proxy target (default http://127.0.0.1:8888; HTTP mode)
 //   PORT               — listen port (default 8787; --port wins; HTTP mode only)
 //
@@ -119,7 +121,20 @@ import {
   listOwnedTerminalHandles,
   applyOwnershipListRedaction,
 } from './lib/state-ownership.mjs';
+import {
+  resolveStoreSigner,
+  readSignedJsonFile,
+  writeSignedJsonFile,
+  SIGNED_STORE_MISSING,
+} from './lib/store-signer.mjs';
 import { executeReleaseWorker } from './lib/release-worker.mjs';
+import {
+  resolveWorkerIsolationConfig,
+  planIsolatedAgentPlacement,
+  buildIsolatedTerminalCreateArgv,
+  mintWorkerCapability,
+  workerIsolationHealth,
+} from './lib/worker-isolation.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -166,8 +181,10 @@ const SENDER_SHARED = process.env.ORCA_BRIDGE_SENDER_SHARED === '1';
 // Precedence: --read-only > ORCA_BRIDGE_TOOLSETS > default-all.
 // ORCA_BRIDGE_CLI_ADMIN=1 unions admin into the enabled set (ignored under --read-only).
 const TOOLSET_GATE = createToolsetGate({ env: process.env, argv: process.argv });
-// Opt-in cli allowlist. Default permissive (hardening off).
-// ORCA_BRIDGE_CLI_HARDENING=1 enforces deny-by-default allowlist.
+// NAS-255: dedicated worker uid (opt-in). Off by default — same-uid legacy.
+const WORKER_ISOLATION = resolveWorkerIsolationConfig(process.env);
+// CLI exact-form allowlist. Default ON (NAS-227).
+// ORCA_BRIDGE_CLI_HARDENING=0|false|off restores warn-only migration posture.
 // Admin unlock follows the effective toolset admin bit (toolset collapse).
 // ownershipCheck / dispatchOwnershipCheck close over live maps (resolved at
 // call time). client_key comes from requestContext via currentClientKey().
@@ -279,8 +296,6 @@ const coordinatorHandles = new Set();
  */
 const clientOwnership = new Map();
 const withClientOrchLock = createSerialLockMap();
-/** Persist pin handles across bridge restarts. */
-const SENDER_PIN_STORE = path.join(os.homedir(), '.orca-bridge-sender-pins.json');
 
 function ownershipFor(clientKey) {
   const k = clientKey || currentClientKey();
@@ -335,11 +350,53 @@ function isRunBound(runId, senderHandle) {
   );
 }
 
-function loadPersistedPins() {
+/** Persist pin handles across bridge restarts. */
+const SENDER_PIN_STORE = path.join(os.homedir(), '.orca-bridge-sender-pins.json');
+
+// Append-only audit log + in-memory dispatch/transcript registry for MCP resources.
+// Override dir with ORCA_BRIDGE_AUDIT_DIR; default ~/.orca-bridge/audit.ndjson
+const AUDIT_DIR = (process.env.ORCA_BRIDGE_AUDIT_DIR || '').trim()
+  || path.join(os.homedir(), '.orca-bridge');
+/**
+ * Separate-uid store signer (NAS-249 / NAS-253).
+ * Socket path in production; ORCA_BRIDGE_STORE_SIGNER_KEY only for tests/isolated HOME.
+ * Not keyed on runtimeId — bindings survive bridge and runtime restarts.
+ */
+const storeSigner = resolveStoreSigner();
+if (!storeSigner) {
+  console.error(
+    'WARN: no store signer configured (set ORCA_BRIDGE_STORE_SIGNER_SOCKET or ' +
+      'ORCA_BRIDGE_STORE_SIGNER_KEY); pin/ownership store writes will fail closed',
+  );
+}
+
+/**
+ * Load sender pins. File must be signed by the store signer (NAS-253).
+ * Unsigned / foreign-key / corrupt → reject entire file (empty pins), not warn-and-accept.
+ */
+async function loadPersistedPins() {
   try {
-    if (!fs.existsSync(SENDER_PIN_STORE)) return;
-    const raw = JSON.parse(fs.readFileSync(SENDER_PIN_STORE, 'utf8'));
-    if (!raw || typeof raw !== 'object') return;
+    if (!storeSigner) {
+      if (fs.existsSync(SENDER_PIN_STORE)) {
+        console.error('WARN: sender pins rejected: store signer unavailable');
+      }
+      return 0;
+    }
+    const res = await readSignedJsonFile(SENDER_PIN_STORE, storeSigner);
+    if (!res.ok) {
+      if (res.reason === SIGNED_STORE_MISSING) return 0;
+      console.error(
+        `WARN: sender pins rejected (${res.reason}${res.error ? `: ${res.error}` : ''}); ` +
+          'unsigned/corrupt/foreign-key store is not loaded',
+      );
+      return 0;
+    }
+    const raw = res.payload;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      console.error('WARN: sender pins rejected: malformed payload');
+      return 0;
+    }
+    let n = 0;
     for (const [k, v] of Object.entries(raw)) {
       if (v && typeof v.handle === 'string' && v.handle) {
         senderCaches.set(k, {
@@ -349,19 +406,33 @@ function loadPersistedPins() {
           title: v.title || undefined,
         });
         rememberCoordinatorHandle(v.handle);
+        n += 1;
       }
     }
+    return n;
   } catch (e) {
-    console.error('WARN: cannot load sender pins:', e.message);
+    console.error('WARN: sender pins rejected:', e.message);
+    return 0;
   }
 }
 
-function persistSenderPin(clientKey, { handle, title, source } = {}) {
+async function persistSenderPin(clientKey, { handle, title, source } = {}) {
   if (!clientKey || !handle) return;
+  if (!storeSigner) {
+    console.error('WARN: cannot persist sender pin: store signer unavailable');
+    return;
+  }
+  // Read-merge current signed store; reject unsigned so a forged base cannot be extended.
   let all = {};
   try {
-    if (fs.existsSync(SENDER_PIN_STORE)) {
-      all = JSON.parse(fs.readFileSync(SENDER_PIN_STORE, 'utf8')) || {};
+    const existing = await readSignedJsonFile(SENDER_PIN_STORE, storeSigner);
+    if (existing.ok && existing.payload && typeof existing.payload === 'object' && !Array.isArray(existing.payload)) {
+      all = { ...existing.payload };
+    } else if (existing.reason && existing.reason !== SIGNED_STORE_MISSING) {
+      console.error(
+        `WARN: sender pin store unreadable for merge (${existing.reason}); writing sole pin for ${clientKey}`,
+      );
+      all = {};
     }
   } catch {
     all = {};
@@ -373,13 +444,15 @@ function persistSenderPin(clientKey, { handle, title, source } = {}) {
     at: new Date().toISOString(),
   };
   try {
-    // Ownership-preserving: a root-run upgrade must not orphan the service
-    // account's pin store (see lib/state-ownership.mjs, NAS-241).
-    const res = writeFilePreservingOwner(SENDER_PIN_STORE, JSON.stringify(all), {
-      mode: STATE_FILE_MODE,
-    });
-    if (res.chownError) {
-      console.error(`WARN: sender pin store owner not restored (${res.chownError}); ` +
+    const res = await writeSignedJsonFile(SENDER_PIN_STORE, all, storeSigner);
+    if (!res.ok) {
+      console.error(
+        `WARN: cannot persist sender pin (${res.reason}${res.error ? `: ${res.error}` : ''})`,
+      );
+      return;
+    }
+    if (res.write && res.write.chownError) {
+      console.error(`WARN: sender pin store owner not restored (${res.write.chownError}); ` +
         `chown it back to the service user or the bridge loses its pins after restart`);
     }
   } catch (e) {
@@ -387,24 +460,23 @@ function persistSenderPin(clientKey, { handle, title, source } = {}) {
   }
 }
 
-loadPersistedPins();
-
-// Append-only audit log + in-memory dispatch/transcript registry for MCP resources.
-// Override dir with ORCA_BRIDGE_AUDIT_DIR; default ~/.orca-bridge/audit.ndjson
-const AUDIT_DIR = (process.env.ORCA_BRIDGE_AUDIT_DIR || '').trim()
-  || path.join(os.homedir(), '.orca-bridge');
 const auditLog = createAuditLog({ dir: AUDIT_DIR });
 const dispatchRegistry = createDispatchRegistry();
 
 /**
- * Durable dispatch ownership bindings (NAS-248 P0 #4).
+ * Durable dispatch ownership bindings (NAS-248 P0 #4 + NAS-249).
  * Survives bridge process restart so coordinators can still release workers they
  * legitimately dispatched. Never written from await/check claim paths — only from
- * dispatch-time bindOwner / hydrate. Not keyed on runtimeId.
+ * dispatch-time bindOwner / hydrate. Not keyed on runtimeId. HMAC-signed via the
+ * separate-uid store signer — unsigned/forged files are rejected on load.
  */
 const OWNERSHIP_STORE = path.join(AUDIT_DIR, 'dispatch-ownership.json');
 
-function persistOwnershipBindings() {
+async function persistOwnershipBindings() {
+  if (!storeSigner) {
+    console.error('WARN: cannot persist dispatch ownership: store signer unavailable');
+    return;
+  }
   try {
     if (!fs.existsSync(AUDIT_DIR)) {
       fs.mkdirSync(AUDIT_DIR, { recursive: true, mode: 0o700 });
@@ -414,14 +486,16 @@ function persistOwnershipBindings() {
       updatedAt: new Date().toISOString(),
       bindings: dispatchRegistry.listOwnershipBindings(),
     };
-    const res = writeFilePreservingOwner(
-      OWNERSHIP_STORE,
-      JSON.stringify(payload, null, 2),
-      { mode: STATE_FILE_MODE },
-    );
-    if (res.chownError) {
+    const res = await writeSignedJsonFile(OWNERSHIP_STORE, payload, storeSigner);
+    if (!res.ok) {
       console.error(
-        `WARN: ownership store owner not restored (${res.chownError}); ` +
+        `WARN: cannot persist dispatch ownership (${res.reason}${res.error ? `: ${res.error}` : ''})`,
+      );
+      return;
+    }
+    if (res.write && res.write.chownError) {
+      console.error(
+        `WARN: ownership store owner not restored (${res.write.chownError}); ` +
           `chown it back to the service user or release-after-restart will fail closed`,
       );
     }
@@ -433,11 +507,26 @@ function persistOwnershipBindings() {
 /**
  * Hydrate registry + clientOwnership from durable bindings after process restart.
  * bindOwner refuses reassignment — first writer wins.
+ * File must verify under the store signer (NAS-249); forge → zero bindings.
  */
-function loadPersistedOwnership() {
+async function loadPersistedOwnership() {
   try {
-    if (!fs.existsSync(OWNERSHIP_STORE)) return 0;
-    const raw = JSON.parse(fs.readFileSync(OWNERSHIP_STORE, 'utf8'));
+    if (!storeSigner) {
+      if (fs.existsSync(OWNERSHIP_STORE)) {
+        console.error('WARN: dispatch ownership rejected: store signer unavailable');
+      }
+      return 0;
+    }
+    const res = await readSignedJsonFile(OWNERSHIP_STORE, storeSigner);
+    if (!res.ok) {
+      if (res.reason === SIGNED_STORE_MISSING) return 0;
+      console.error(
+        `WARN: dispatch ownership rejected (${res.reason}${res.error ? `: ${res.error}` : ''}); ` +
+          'unsigned/corrupt/foreign-key store is not loaded',
+      );
+      return 0;
+    }
+    const raw = res.payload;
     const bindings = Array.isArray(raw?.bindings)
       ? raw.bindings
       : Array.isArray(raw)
@@ -474,7 +563,7 @@ function loadPersistedOwnership() {
     }
     return n;
   } catch (e) {
-    console.error('WARN: cannot load dispatch ownership:', e.message);
+    console.error('WARN: dispatch ownership rejected:', e.message);
     return 0;
   }
 }
@@ -483,7 +572,7 @@ function loadPersistedOwnership() {
  * Authoritative dispatch-time ownership bind + durable persist.
  * The only path that may create a clientKey binding for a dispatch id.
  */
-function bindOwnedDispatch({
+async function bindOwnedDispatch({
   runId,
   dispatchId,
   terminalHandle,
@@ -526,11 +615,13 @@ function bindOwnedDispatch({
     taskId,
     clientKey: ck,
   });
-  persistOwnershipBindings();
+  await persistOwnershipBindings();
   return bound;
 }
 
-const _ownershipHydrated = loadPersistedOwnership();
+// Top-level await is valid in this ESM module; hydrate before accepting traffic.
+await loadPersistedPins();
+const _ownershipHydrated = await loadPersistedOwnership();
 if (_ownershipHydrated > 0) {
   console.error(`orca-bridge: restored ${_ownershipHydrated} durable dispatch ownership binding(s)`);
 }
@@ -1161,7 +1252,7 @@ async function resolveSenderTerminal({ force = false } = {}) {
     });
     // Persist so bridge restart reuses the same handle (keeps run binding).
     if (source === 'created' || source === 'pinned' || source === 'persisted' || source === 'title' || source === 'env' || source === 'env-shared' || source === 'title-suffix') {
-      persistSenderPin(clientKey, { handle, title, source });
+      await persistSenderPin(clientKey, { handle, title, source });
     }
     return {
       handle,
@@ -1275,7 +1366,7 @@ async function resolveSenderTerminal({ force = false } = {}) {
     source: 'created',
     title: clientTitle,
   });
-  persistSenderPin(clientKey, { handle, title: clientTitle, source: 'created' });
+  await persistSenderPin(clientKey, { handle, title: clientTitle, source: 'created' });
   return { handle, source: 'created', clientKey, title: clientTitle };
 }
 
@@ -1381,7 +1472,7 @@ function looksWorking(snap) {
  * If inject did not land in TUI (common for grok: accepted but Turns:0 idle),
  * push the task text via terminal send + Enter, with worker_done recovery trailer.
  */
-async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent }) {
+async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent, workerCapability = null }) {
   const settleMs = Number(process.env.ORCA_BRIDGE_INJECT_SETTLE_MS || 10_000);
   const probes = [];
   await sleep(Math.min(Math.max(settleMs, 3_000), 25_000));
@@ -1393,6 +1484,9 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent }) {
   }
 
   // Still idle — send recovery prompt (spec + ids + worker_done contract)
+  const capLine = workerCapability
+    ? `ORCA_WORKER_CAPABILITY is set for this dispatch (NAS-255 worker uid).\n`
+    : '';
   const recovery =
     `${spec}\n\n` +
     `[coordinator inject-recovery] Dispatch inject may not have landed in this TUI (idle Turns:0). ` +
@@ -1400,6 +1494,7 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent }) {
     `task_id: ${taskId}\n` +
     `dispatch_id: ${dispatchId || '(unknown)'}\n` +
     `agent: ${agent}\n` +
+    capLine +
     `When finished, send exactly one:\n` +
     `orca orchestration send --type worker_done --subject "done" --body "<3 sentences>" ` +
     `--task-id ${taskId}` +
@@ -1563,11 +1658,115 @@ async function dispatchWorker(args = {}) {
   }
 
   // 3) Place agent terminal
+  // NAS-255: when worker isolation is active, never pass --agent to worktree
+  // create (Orca would spawn as the bridge uid). Create the worktree bare, then
+  // terminal create --command <wrapper agent> so the agent runs as orca-worker.
   let handle = '';
   let worktreePath = null;
   let worktreeId = null;
+  let workerLaunchCommand = null;
 
-  if (worktree === 'current') {
+  const isolationPlan = planIsolatedAgentPlacement(
+    {
+      worktree,
+      agent,
+      name: name || autoName('ha'),
+      repo: repo || '',
+      setup,
+      baseBranch,
+    },
+    WORKER_ISOLATION,
+  );
+
+  if (isolationPlan.mode === 'isolated-command') {
+    workerLaunchCommand = isolationPlan.launchCommand;
+    if (worktree === 'current') {
+      const termArgv = isolationPlan.terminalArgv;
+      const termRes = await runJson(termArgv, { timeoutMs: WORKER_START_TIMEOUT_MS });
+      steps.push({ step: 'terminal-create-isolated', launchCommand: workerLaunchCommand, ...termRes });
+      if (!envOk(termRes)) {
+        return {
+          ok: false,
+          stage: 'terminal-create',
+          run_id: runId,
+          task_id: taskId,
+          error: 'terminal create (worker-uid wrapper) failed',
+          worker_isolation: workerIsolationHealth(WORKER_ISOLATION),
+          steps,
+        };
+      }
+      const tr = termRes.envelope?.result || {};
+      handle =
+        pick(tr, 'handle') ||
+        pick(tr.terminal, 'handle') ||
+        pick(tr, 'agentTerminalHandle') ||
+        '';
+    } else {
+      if (!repo) {
+        return {
+          ok: false,
+          stage: 'worktree-create',
+          run_id: runId,
+          task_id: taskId,
+          error: 'repo is required for new worktree (pass repo or set ORCA_BRIDGE_DEFAULT_REPO)',
+          steps,
+        };
+      }
+      const wtArgv = isolationPlan.worktreeArgv;
+      const wtRes = await runJson(wtArgv, { timeoutMs: WORKER_START_TIMEOUT_MS });
+      steps.push({ step: 'worktree-create-isolated', ...wtRes });
+      if (!envOk(wtRes)) {
+        return {
+          ok: false,
+          stage: 'worktree-create',
+          run_id: runId,
+          task_id: taskId,
+          error: 'worktree create (no --agent; worker-uid path) failed',
+          steps,
+        };
+      }
+      const wr = wtRes.envelope?.result || {};
+      worktreePath = pick(wr, 'path') || pick(wr.worktree, 'path') || null;
+      worktreeId = pick(wr, 'id') || null;
+      const wtSel = worktreePath
+        ? (String(worktreePath).startsWith('path:') ? String(worktreePath) : `path:${worktreePath}`)
+        : (worktreeId ? String(worktreeId) : null);
+      if (!wtSel) {
+        return {
+          ok: false,
+          stage: 'place-agent',
+          run_id: runId,
+          task_id: taskId,
+          error: 'isolated worktree create returned no path/id for terminal create',
+          steps,
+        };
+      }
+      const termArgv = buildIsolatedTerminalCreateArgv({
+        worktreeSelector: wtSel,
+        name: name || autoName('ha'),
+        launchCommand: workerLaunchCommand,
+      });
+      const termRes = await runJson(termArgv, { timeoutMs: WORKER_START_TIMEOUT_MS });
+      steps.push({ step: 'terminal-create-isolated', launchCommand: workerLaunchCommand, ...termRes });
+      if (!envOk(termRes)) {
+        return {
+          ok: false,
+          stage: 'terminal-create',
+          run_id: runId,
+          task_id: taskId,
+          error: 'terminal create (worker-uid wrapper) failed after isolated worktree',
+          worktree: worktreePath,
+          steps,
+        };
+      }
+      const tr = termRes.envelope?.result || {};
+      handle =
+        pick(tr, 'handle') ||
+        pick(tr.terminal, 'handle') ||
+        pick(tr, 'agentTerminalHandle') ||
+        '';
+    }
+  } else if (worktree === 'current') {
     if (!repo) {
       return {
         ok: false,
@@ -1653,7 +1852,7 @@ async function dispatchWorker(args = {}) {
     worktreeId = pick(wr, 'id') || null;
   }
 
-  if (!handle) {
+    if (!handle) {
     return {
       ok: false,
       stage: 'place-agent',
@@ -1694,7 +1893,21 @@ async function dispatchWorker(args = {}) {
   const dr = dispRes.envelope?.result || {};
   const dispatchId = pick(dr.dispatch, 'id') || pick(dr, 'dispatchId', 'dispatch_id');
 
-  // 6) Inject liveness (Grok/others: inject accepted but TUI stays Turns:0)
+  // 6) Mint worker capability (NAS-255) then inject liveness recovery.
+  let workerCapability = null;
+  if (WORKER_ISOLATION.enabled && WORKER_ISOLATION.hmacSecret && dispatchId && taskId) {
+    try {
+      workerCapability = mintWorkerCapability({
+        dispatchId,
+        taskId,
+        terminalHandle: handle,
+        clientKey: currentClientKey(),
+      }, WORKER_ISOLATION.hmacSecret);
+    } catch (e) {
+      steps.push({ step: 'worker-capability', error: String(e?.message || e) });
+    }
+  }
+
   // Skip only if ORCA_BRIDGE_INJECT_RECOVERY=0
   let injectRecovery = { recovered: false, landed: true, probes: [], skipped: false };
   if (process.env.ORCA_BRIDGE_INJECT_RECOVERY === '0') {
@@ -1707,6 +1920,7 @@ async function dispatchWorker(args = {}) {
         dispatchId,
         spec,
         agent,
+        workerCapability,
       });
       steps.push({
         step: 'inject-liveness',
@@ -1730,7 +1944,7 @@ async function dispatchWorker(args = {}) {
 
   // Authoritative ownership bind at dispatch-time only (NAS-248 P0 #4).
   // await/check must never create or reassign clientKey bindings.
-  bindOwnedDispatch({
+  await bindOwnedDispatch({
     runId,
     dispatchId: dispatchId || null,
     terminalHandle: handle,
@@ -1742,7 +1956,7 @@ async function dispatchWorker(args = {}) {
   });
 
 
-  return {
+    return {
     ok: true,
     stage: 'ready',
     run_id: runId,
@@ -1759,6 +1973,11 @@ async function dispatchWorker(args = {}) {
     inject_recovered: injectRecovery.recovered === true,
     inject_landed: injectRecovery.landed,
     client_key: currentClientKey(),
+    worker_isolation: workerIsolationHealth(WORKER_ISOLATION),
+    worker_launch_command: workerLaunchCommand,
+    worker_capability_minted: Boolean(workerCapability),
+    // Capability is for the worker process env (wrapper); not echoed in full to coordinators.
+    worker_capability_len: workerCapability ? workerCapability.length : 0,
     next: {
       action: 'await',
       detail:
@@ -2317,6 +2536,7 @@ async function healthPayload({ verbose = false } = {}) {
       note:
         '0.2.13+: pin-by-handle + persist; await skips run-use when already bound (ack-safe); ' +
         'two coordinators need two OAuth tokens. ORCA_BRIDGE_SENDER_SHARED=1 = single-tenant only.',
+      workerUid: workerIsolationHealth(WORKER_ISOLATION),
     },
     hindsightTarget: HINDSIGHT_URL.href,
     actions: ['health', 'dispatch', 'await', 'release', 'guide', 'check', 'cli'],

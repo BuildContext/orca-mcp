@@ -1,0 +1,18 @@
+# NAS-255 — bridge account may only launch the worker wrapper / agent as orca-worker.
+# Install: sudo install -m 440 deploy/linux/orca-mcp-workers.sudoers /etc/sudoers.d/orca-mcp-workers
+# Validate: sudo visudo -cf /etc/sudoers.d/orca-mcp-workers
+#
+# Defaults assume:
+#   bridge service account = orca
+#   worker account         = orca-worker
+# Adjust both names if you renamed them; keep the command allowlist tight.
+
+Defaults:orca !requiretty
+Defaults:orca secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Wrapper itself (if ever invoked via sudo).
+orca ALL=(root) NOPASSWD: /usr/local/lib/orca-mcp/orca-omp-as-worker.sh
+
+# Direct agent binaries as the worker uid — the wrapper uses `sudo -n -u orca-worker -- <agent>`.
+# Extend this list when you enable additional TUI agents under isolation.
+orca ALL=(orca-worker) NOPASSWD: /usr/local/bin/omp, /usr/bin/omp, /usr/local/bin/grok, /usr/bin/grok, /usr/local/bin/node, /usr/bin/node

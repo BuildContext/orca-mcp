@@ -1,0 +1,56 @@
+[Unit]
+Description=orca-bridge store signer (NAS-249 / NAS-253)
+Documentation=file:///opt/orca-mcp/docs/design.md
+After=network-online.target
+Wants=network-online.target
+# Bridge unit should order After= this one so the socket exists at hydrate.
+Before=orca-bridge.service
+
+[Service]
+Type=simple
+# Dedicated uid — NOT the bridge user and NOT the worker uid.
+# The HMAC key lives only in this account's state dir.
+User=orca-bridge-signer
+Group=orca-bridge-signer
+# Bridge processes join SupplementaryGroups=orca-bridge-signer so they can open
+# the 0660 socket. Worker uids must NOT be in that group — that is how the
+# socket is closed off from workers (see also SocketMode / chmod 0660 below).
+SupplementaryGroups=
+WorkingDirectory=/opt/orca-mcp
+# Runtime dir for the unix socket. Mode 0750, group orca-bridge-signer:
+# only the signer uid and members of that group can traverse /run/orca-bridge.
+RuntimeDirectory=orca-bridge
+RuntimeDirectoryMode=0750
+# Key material: only this uid.
+StateDirectory=orca-bridge-signer
+StateDirectoryMode=0700
+Environment=ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock
+Environment=ORCA_BRIDGE_STORE_SIGNER_KEY_FILE=/var/lib/orca-bridge-signer/hmac.key
+# Prefer checkout install; swap for global bin if needed.
+ExecStart=/usr/bin/node /opt/orca-mcp/scripts/store-signer-daemon.mjs
+# After start, enforce socket mode 0660 (owner=signer, group=orca-bridge-signer).
+# UMask leaves group write; chmod is belt-and-suspenders if the daemon's own
+# chmod races with a client connect.
+ExecStartPost=/usr/bin/chmod 0660 /run/orca-bridge/store-signer.sock
+# Ensure the bridge group owns the socket group bit even if the daemon umask differs.
+ExecStartPost=/usr/bin/chgrp orca-bridge-signer /run/orca-bridge/store-signer.sock
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orca-bridge-store-signer
+Restart=always
+RestartSec=2
+# Hardening — key must never leave this unit's filesystem view.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/orca-bridge /var/lib/orca-bridge-signer
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -66,7 +66,7 @@ We want private reports for issues such as:
 - **Authentication bypass** — reaching tool actions without a valid master token, issued OAuth access token, path-token URL, or live MCP session (HTTP), or without the configured env token gate (stdio startup)
 - **Broken access control between callers** — e.g. one OAuth client reliably acting on another client's dispatches/terminals beyond documented shared-token / `ORCA_BRIDGE_SENDER_SHARED` behavior
 - **Bypass of always-on controls** — especially the forbidden handoff gate (`worktree create` + agent + prompt via raw `action=cli`)
-- **Bypass of opt-in hardening when enabled** — `ORCA_BRIDGE_CLI_HARDENING=1` allowlist, `ORCA_BRIDGE_TOOLSETS` / `--read-only` tier gates
+- **Bypass of default-on / opt-in controls** — exact-form CLI allowlist (`ORCA_BRIDGE_CLI_HARDENING`, default on), `ORCA_BRIDGE_TOOLSETS` / `--read-only` tier gates
 - **Secret leakage** — master/OAuth tokens or other secrets written to the audit log, access log, or tool results in ways that defeat documented redaction
 - **Transport / session confusion** — e.g. stdio protocol smuggling onto stdout, HTTP request smuggling that skips the auth gate, open redirect beyond `ORCA_BRIDGE_REDIRECT_ALLOW`
 - **Supply-chain / install integrity** issues in this repository's published artifacts (when publishing exists)
@@ -76,7 +76,7 @@ We want private reports for issues such as:
 The following are **not** vulnerabilities in this project:
 
 - **An authenticated caller doing what the tool is designed to do.** With a valid token (or equivalent auth), `dispatch`, `cli`, worktree/terminal operations, and agent control are the product. That includes spawning agents, writing files via those agents, and running Orca CLI that the host user can already run.
-- **Default-permissive configuration.** By design, toolsets default to `{status,dispatch,admin}` and CLI hardening is off unless `ORCA_BRIDGE_CLI_HARDENING=1`. Operators who leave defaults on a shared host have chosen a trusted-coordinator deploy.
+- **Default-open toolsets.** By design, toolsets default to `{status,dispatch,admin}`. CLI exact-form hardening is **on** by default (NAS-227); operators may set `ORCA_BRIDGE_CLI_HARDENING=0` only for migration. Leaving admin toolset enabled on a shared host is still a trusted-coordinator deploy.
 - **Lack of OS sandboxing.** The bridge does not isolate filesystem, network, or process namespace. It runs as the host user (or service user) and inherits that user's powers.
 - **Compromise of the host user account, MCP client, or Orca binary** outside the bridge — stolen laptop, malicious local process reading `ORCA_BRIDGE_TOKEN` from the environment, compromised `orca`/`orca-ide` binary.
 - **Social engineering / prompt injection against a model** that an *already authenticated* coordinator chooses to trust, except where you can show a **bridge bug** that bypasses a documented control (e.g. handoff gate bypass).
@@ -84,13 +84,13 @@ The following are **not** vulnerabilities in this project:
 - **Issues only in third-party MCP clients, proxies, or inspectors** (for example historical classes like mcp-remote [CVE-2025-6514](https://github.com/advisories/GHSA-6xpm-ggf7-wc3p) or MCP Inspector [CVE-2025-49596](https://github.com/modelcontextprotocol/inspector/security/advisories/GHSA-7f8r-222p-6f5g)) unless this repo ships a vulnerable integration path of its own.
 - **Missing enterprise features** (SSO, per-tool IAM, network policies, multi-tenant hard isolation beyond documented OAuth client sender pins).
 
-## Hardening knobs (not defaults)
+## Hardening knobs
 
-Defaults are permissive so existing coordinators keep working. For shared or less-trusted deployments, operators should restrict explicitly:
+CLI exact-form allowlist defaults **on** (NAS-227). Toolsets still default open so existing coordinators keep working — restrict them on shared hosts:
 
 ```bash
 export ORCA_BRIDGE_TOOLSETS=status,dispatch   # drop raw admin cli
-export ORCA_BRIDGE_CLI_HARDENING=1            # deny-by-default allowlist on action=cli
+# ORCA_BRIDGE_CLI_HARDENING is on by default; only set 0 for migration
 # observer only:
 # node server.mjs --port 8787 --read-only
 ```

@@ -78,15 +78,15 @@ Anyone who can authenticate to the bridge can drive Orca **as the bridge OS user
 
 **Vector:** Stolen OAuth token, malicious remote agent, insider.  
 **Impact:** Under **default** config: `dispatch` agents, raw `cli`, worktree create/rm, `terminal send` — i.e. intentional product capabilities → host-level impact.  
-**Mitigations today:** Opt-in `ORCA_BRIDGE_TOOLSETS` / `--read-only`; opt-in `ORCA_BRIDGE_CLI_HARDENING=1`; always-on forbidden handoff on raw CLI; per-client sender isolation for separate OAuth clients; audit log.  
-**Not mitigated:** “Auth means trusted.” There is **no** per-caller authorization beyond possessing a valid token/session. Hostile-but-authenticated is a deploy problem (don't hand tokens to untrusted parties; turn hardening on).
+**Mitigations today:** Opt-in `ORCA_BRIDGE_TOOLSETS` / `--read-only`; default-on exact-form CLI allowlist (`ORCA_BRIDGE_CLI_HARDENING`, off only via `0`/`false`/`off`); always-on forbidden handoff on raw CLI; per-client sender isolation for separate OAuth clients; audit log.  
+**Not mitigated:** “Auth means trusted.” There is **no** per-caller authorization beyond possessing a valid token/session. Hostile-but-authenticated is a deploy problem (don't hand tokens to untrusted parties; restrict toolsets).
 
 ### T3 — Prompt injection → `cli` argv
 
 **Vector:** Untrusted content in a worker or coordinator context eventually causes `action=cli` with dangerous argv (or tricks a model into calling admin surfaces).  
-**Impact:** Depends on toolsets + CLI hardening. With defaults, nearly full Orca CLI surface.  
-**Mitigations today:** Always-on reject of unsupervised `worktree create --agent/--prompt` handoff (`isForbiddenHandoffArgv`); supervised `dispatch` path only for agent start; optional deny-by-default allowlist; tool annotations mark `cli`/`dispatch` destructive.  
-**Not mitigated:** Model obedience. Hardening knobs are **off** unless set. Injection that stays within allowlisted prefixes still runs those prefixes.
+**Impact:** Depends on toolsets + CLI hardening. Defaults enforce exact command forms; admin forms still require the admin toolset.  
+**Mitigations today:** Always-on reject of unsupervised `worktree create --agent/--prompt` handoff (`isForbiddenHandoffArgv`); supervised `dispatch` path only for agent start; default-on exact-form allowlist (NAS-254/227); tool annotations mark `cli`/`dispatch` destructive.  
+**Not mitigated:** Model obedience. Injection that stays within allowlisted exact forms still runs those forms.
 
 ### T4 — Malicious MCP client / confused deputy
 
@@ -131,13 +131,15 @@ MCP security guidance (official best practices and the above advisories) converg
 | Audit log | **On** (dir configurable) | Redacted append-only NDJSON + MCP resources |
 | OAuth + PKCE (HTTP) | Available | Master token stays out of remote client settings when OAuth is used |
 | Per-OAuth-client sender isolation | On (unless shared pin) | `lib/orch-isolation.mjs` |
-| CLI allowlist | **Opt-in** | `ORCA_BRIDGE_CLI_HARDENING=1` |
+| Dedicated worker uid (NAS-255) | **Opt-in** | `ORCA_BRIDGE_WORKER_ISOLATION=1` + `lib/worker-isolation.mjs` + deploy/linux wrappers; FS 0600 bridge-owned secrets |
+| CLI exact-form allowlist | **On** (NAS-227); `0`/`false`/`off` = warn-only | `ORCA_BRIDGE_CLI_HARDENING` |
 | Capability toolsets | **Opt-in restrict** | `ORCA_BRIDGE_TOOLSETS`, `--read-only`; default = all tiers |
 
 ## Explicitly NOT mitigated
 
 - **No OS sandbox** (no container, seccomp, or FS jail imposed by the bridge)
-- **Permissive defaults** — admin toolset on; CLI hardening off
+- **Per-dispatch worker uid / worker-to-worker isolation** — NAS-255 ships one shared worker account only (opt-in `ORCA_BRIDGE_WORKER_ISOLATION=1`). See [runbooks/nas-255-worker-uid.md](./runbooks/nas-255-worker-uid.md).
+- **Permissive toolset defaults** — admin toolset on; CLI exact-form hardening on
 - **No per-caller authorization** beyond “has a valid token/session”
 - **No guarantee** that agent-driven file writes, network calls, or git pushes are blocked
 - **No multi-tenant hard isolation** on shared master path-token or `ORCA_BRIDGE_SENDER_SHARED=1`
