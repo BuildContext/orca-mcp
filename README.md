@@ -37,23 +37,24 @@ Orca today is driven by its CLI. This project is a small, zero-dependency Node.j
 - reach the **host filesystem and network** indirectly through those agents and the Orca CLI
 - execute anything the bridge OS user (and your `orca` / `orca-ide` binary) can already do
 
-Defaults are **permissive on purpose** (back-compat for trusted coordinators):
+Defaults (toolsets stay open for trusted coordinators; CLI surface is exact-form locked):
 
 | Control | Default |
 | --- | --- |
 | Capability toolsets (`status` / `dispatch` / `admin`) | **all enabled** |
-| `ORCA_BRIDGE_CLI_HARDENING` allowlist on `action=cli` | **off** (warn-only) |
+| `ORCA_BRIDGE_CLI_HARDENING` exact-form allowlist on `action=cli` | **on** (NAS-227); set `0`/`false`/`off` for warn-only |
 | OS / FS / network sandbox | **none** |
 | Per-caller authz beyond possessing the token/session | **none** |
 
 Always-on guardrails are narrow: HTTP binds **`127.0.0.1` only**, spawn is **`execFile` of the Orca binary only** (no shell), unsupervised `worktree create --agent --prompt` via raw `cli` is rejected, master-token compare is timing-safe, and the audit log redacts common secrets. That is **not** equivalent to “safe for untrusted users.”
 
-### Shared or untrusted deployments — turn hardening on
+### Shared or untrusted deployments — restrict toolsets
 
 ```bash
 # Supervised coordinators only — drop raw admin CLI (terminal send, worktree rm, …):
 export ORCA_BRIDGE_TOOLSETS=status,dispatch
-export ORCA_BRIDGE_CLI_HARDENING=1
+# CLI exact-form allowlist is ON by default (NAS-227). Explicit off only for migration:
+# export ORCA_BRIDGE_CLI_HARDENING=0
 
 # Read-only observer (health / inventory / check):
 node server.mjs --port 8787 --read-only
@@ -400,7 +401,7 @@ Example wave:
 | `ORCA_BRIDGE_SENDER_TITLE` | Title for auto-created coordinator tabs |
 | `ORCA_BRIDGE_SENDER_SHARED` | `1` = force all clients onto the env pin (disables multi-coordinator isolation) |
 | `ORCA_BRIDGE_TOOLSETS` | Comma list of enabled tiers: `status`, `dispatch`, `admin` (default = **all three**) |
-| `ORCA_BRIDGE_CLI_HARDENING` | `1` = enforce deny-by-default allowlist on `action=cli` |
+| `ORCA_BRIDGE_CLI_HARDENING` | Default **on** (exact-form allowlist). `0`/`false`/`off` = warn-only migration |
 | `ORCA_BRIDGE_CLI_ADMIN` | `1` = union `admin` into enabled toolsets (compat with CLI allowlist admin; ignored under `--read-only`) |
 | `ORCA_BRIDGE_DEBUG` | `0` mutes access log (stderr in `--stdio`, stdout in HTTP) |
 | `HINDSIGHT_URL` | HTTP only. Optional Hindsight proxy target (default `http://127.0.0.1:8888`) |
@@ -444,11 +445,11 @@ Mapping lives in one module: [`lib/toolsets.mjs`](./lib/toolsets.mjs) (`ACTION_T
 
 Compat: `ORCA_BRIDGE_CLI_ADMIN=1` **adds** `admin` to the enabled set when the env list omitted it. It does **not** override `--read-only`.
 
-`ORCA_BRIDGE_CLI_HARDENING` remains the allowlist enforcer on `action=cli` (warn-don’t-block when off). The toolset `admin` bit is what unlocks admin prefixes under hardening — one admin concept, not two competing switches.
+`ORCA_BRIDGE_CLI_HARDENING` enforces the exact-form allowlist on `action=cli` (default **on**, NAS-227). Set `0`/`false`/`off` for warn-don’t-block migration. The toolset `admin` bit unlocks admin forms under hardening — one admin concept, not two competing switches.
 
-### Default is permissive (owner decision)
+### Toolsets default open; CLI forms default locked (owner decision)
 
-**All tiers are ON unless you restrict them.** Existing coordinators need zero config changes. Restriction is an explicit operator choice.
+**All toolset tiers are ON unless you restrict them.** CLI exact-form allowlist is **ON** by default (NAS-227). Existing coordinators that only use doctrine forms need zero config; non-form argv requires `ORCA_BRIDGE_CLI_HARDENING=0` or an allowlist expansion.
 
 When a tier is disabled, the bridge returns a structured error (not a bare string):
 
@@ -471,14 +472,14 @@ When a tier is disabled, the bridge returns a structured error (not a bare strin
 ```bash
 # Supervised coordinators only — no raw admin cli:
 export ORCA_BRIDGE_TOOLSETS=status,dispatch
-export ORCA_BRIDGE_CLI_HARDENING=1
+# CLI exact-form allowlist is already ON by default (NAS-227).
 
 # Read-only observer (health / inventory / check):
 node server.mjs --port 8787 --read-only
 # equivalent: ORCA_BRIDGE_TOOLSETS=status
 ```
 
-> **SHOULD** set `ORCA_BRIDGE_TOOLSETS` (and usually `ORCA_BRIDGE_CLI_HARDENING=1`) on any bridge reachable by more than a trusted coordinator. Safe posture is one env var away — it is intentionally **not** the default so existing installs keep working.
+> **SHOULD** set `ORCA_BRIDGE_TOOLSETS=status,dispatch` on any bridge reachable by more than a trusted coordinator. CLI hardening is already the default; toolset restriction is the remaining operator knob.
 
 Both Streamable HTTP and `--stdio` resolve toolsets the same way: `createToolsetGate({ env: process.env, argv: process.argv })` at process start.
 
@@ -578,7 +579,7 @@ ORCA_BRIDGE_PUBLIC_ORIGIN=https://your-host.ts.net
 ORCA_CLI_COMMAND=orca-ide   # if that is your binary name
 # recommended on shared hosts:
 # ORCA_BRIDGE_TOOLSETS=status,dispatch
-# ORCA_BRIDGE_CLI_HARDENING=1
+# CLI hardening is ON by default (NAS-227); set ORCA_BRIDGE_CLI_HARDENING=0 only for migration
 ```
 
 #### 5. Start and verify ownership
@@ -649,7 +650,7 @@ Read the blunt [Security warning](#security-warning) first. Operational facts:
 - **stdio mode** is a local subprocess: auth is `ORCA_BRIDGE_TOKEN` from the host env / MCP client config (no OAuth browser flow). stdout carries **only** JSON-RPC; logs go to stderr.
 - Auth: constant-time token compare (`tokenMatches`); OAuth access tokens (HTTP) are revocable (delete `~/.orca-bridge-tokens.json` + restart).
 - Process spawn is **only** the Orca binary — no arbitrary shell through the bridge.
-- Full CLI surface is powerful (`terminal send`, etc.). **Default toolsets leave it available** for back-compat; restrict with `ORCA_BRIDGE_TOOLSETS` / `--read-only` and optionally `ORCA_BRIDGE_CLI_HARDENING=1` (see [Capability toolsets](#capability-toolsets)).
+- Full CLI surface is powerful (`terminal send`, etc.). **Default toolsets leave admin forms available** for back-compat; restrict with `ORCA_BRIDGE_TOOLSETS` / `--read-only`. Exact-form CLI allowlist is **on** by default (see [Capability toolsets](#capability-toolsets)).
 - Append-only **audit log** (redacted NDJSON under `ORCA_BRIDGE_AUDIT_DIR` or `~/.orca-bridge`) records tool calls for forensics — it is not an access-control layer.
 - Rotate master token by setting a new `ORCA_BRIDGE_TOKEN`, restarting, and re-pairing clients.
 - Threat model: [`docs/threat-model.md`](./docs/threat-model.md). Report vulnerabilities privately: [`SECURITY.md`](./SECURITY.md).
