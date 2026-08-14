@@ -1985,3 +1985,79 @@ Do not treat 434/0 + MUT1–4b FAIL as merge-complete. Minimum before CLEAN:
 
 Until (2) and an explicit (3) decision, **DIRTY**.
 
+
+# Fix author closeout — r12 (`BuildContext/nas-248-ownership-invariant`)
+
+**Worktree:** `/home/orca/orca/workspaces/orca-mcp/nas-252-review-r9`  
+**Base:** `d14727a` (5cd47fd + r12 adversarial review)  
+**Scope:** three r12 findings only — MUT6 collection-path class lock; residual (a) flag-only address shape; residual (b) `file open` path selectors. No NAS-249/253/254/255.
+
+## What changed
+
+1. **MUT6 — collection derived from worktree class, not a spelling branch.**  
+   - Added `deriveWorktreeClassAddressFlags()` = handler map entries with `resolver === 'worktree'`.  
+   - Added `collectWorktreeClassTargetsFromArgv()` — single collector used by `evaluateCliArgv` for every worktree-class flag. `--worktree` keeps full collector semantics; aliases (today: `--workspace`) use Item-5 grammar filtering via `filterWorktreeGrammarValues`.  
+   - Removed the `if (name === 'worktree') … else { … }` per-spelling branch inside the flag loop.  
+   - Differential now asserts the derived class collector sees every class flag and that evaluate hits `worktreeOwnershipCheck` for each. Emptying the collector (MUT6) fails the differential **and** the effect suite.
+
+2. **Residual (a) — flag-only address shape.**  
+   - Added `SPEC_CONTENT_FLAGS` (known content census, separate from `NON_TARGET_FLAGS`).  
+   - `deriveRequiredAddressFlags` now extends with every `allowedFlags` entry that is not known content / admin / global — not only non-content positionals.  
+   - Flag-only `--recipient` in a synthetic spec without a handler-map entry is now required address (`null` resolver) → differential demands `kind=target`. Demoting only into `NON_TARGET` without updating `SPEC_CONTENT_FLAGS` fails.
+
+3. **Residual (b) — `file open` path selectors.**  
+   - Added `collectFileOpenPathTargetsFromArgv` (normalizes positionals first). Only `file open` / `file diff` treat `--path` worktree-grammar values as ownership targets; `--path` stays `NON_TARGET` globally (repo add, emulator install, …).  
+   - Alias family covered: `path:`, bare abs, `name:`, `branch:`, `issue:`, `id:repo::…`, trailing slash, dot segments, duplicate flags.  
+   - `normalizeWorktreeSelector` collapses `.` / `..` / trailing slashes and keeps `branch:` / `issue:` forms.
+
+## Fail-before / pass-after (verified)
+
+| Finding | On `d14727a` module copy | After fix |
+|---------|--------------------------|-----------|
+| residual (b) file open family (16 cases) | **16/16 allow_with_warning** (assert deny would FAIL) | deny `handle_not_owned`, checker invoked |
+| residual (a) `deriveRequiredAddressFlags([{allowedFlags:['recipient']}]).has('recipient')` | **false** | **true** |
+| MUT6 class collector / `deriveWorktreeClassAddressFlags` | **undefined** symbols; MUT6 edit → workspace `allow_with_warning` | symbols present; MUT6 empty-collector → differential FAIL + effect FAIL |
+
+New tests (each would fail on d14727a, pass after):
+
+- `NAS-252 r12 MUT6 collection-path class lock`
+- `NAS-252 r12 residual (a) flag-only address shape`
+- `NAS-252 r12 residual (b) file open path selectors`
+
+## Mutation re-run on real files (restored; md5 match)
+
+```
+MUT1=FAIL MUT2=FAIL MUT3=FAIL MUT4A=FAIL MUT4B=FAIL MUT6=FAIL
+```
+
+MUT6 now fails the **differential** (not only effect): `collectWorktreeClassTargetsFromArgv must see --workspace: []`. Effect suite: 3 pass / 6 fail under empty collector. Files restored; md5 `lib/cli-policy.mjs` / `lib/cli-argv-normalize.mjs` match pre-mutation.
+
+## Suite
+
+```
+# tests 441
+# pass 441
+# fail 0
+```
+
+(+7 vs 434 at d14727a): r12 MUT6 / residual-a / residual-b suites + differential class-lock assertions.
+
+## Isolated-HOME bridge (`/tmp/nas-252-r13-iso`, PORT 18824)
+
+Four coordinator shapes (r9 break / r10 fix) — **spawned, ok=true**:
+
+1. `reply --body term_FOREIGN` (owned address)  
+2. `send --subject/--payload term_FOREIGN` (owned `--to`)  
+3. `linear issue NAS-252`  
+4. `computer permissions --id accessibility`  
+
+Closed holes stay closed (deny, empty spawn): foreign show, `@all`, `@worktree:path:/foreign`, `--workspace path:/foreign`, `file open path:/foreign` + `/abs` + `name:secret`, stop worktree foreign, auto show, computer task_FOREIGN, unscoped worker-list.  
+`action=release` foreign dispatch/handle → `mode=ownership_denied`, no teardown spawn.  
+`--from` overwrite still holds on reply spoof.
+
+## Honesty
+
+- Did not flip live `ORCA_BRIDGE_CLI_HARDENING`, restart live bridge, or write live `~/.orca-bridge*`.  
+- Did not touch NAS-249/253 bind oracles, NAS-254 allowlist collapse, NAS-255 per-worker-uid.  
+- `--ack` UUID residual and MUT4c2 always-owned stub remain P2 / architectural, out of this three-item scope.  
+- `file open secret.env` (relative non-selector) still allows — only worktree-grammar path values are gated, matching NAS-251 family intent.
