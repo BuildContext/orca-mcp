@@ -166,8 +166,8 @@ const SENDER_SHARED = process.env.ORCA_BRIDGE_SENDER_SHARED === '1';
 // Precedence: --read-only > ORCA_BRIDGE_TOOLSETS > default-all.
 // ORCA_BRIDGE_CLI_ADMIN=1 unions admin into the enabled set (ignored under --read-only).
 const TOOLSET_GATE = createToolsetGate({ env: process.env, argv: process.argv });
-// Opt-in cli allowlist. Default permissive (hardening off).
-// ORCA_BRIDGE_CLI_HARDENING=1 enforces deny-by-default allowlist.
+// CLI exact-form allowlist. Default ON (NAS-227).
+// ORCA_BRIDGE_CLI_HARDENING=0|false|off restores warn-only migration posture.
 // Admin unlock follows the effective toolset admin bit (toolset collapse).
 // ownershipCheck / dispatchOwnershipCheck close over live maps (resolved at
 // call time). client_key comes from requestContext via currentClientKey().

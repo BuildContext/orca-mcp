@@ -48,7 +48,7 @@
         },
         {
           "name": "ORCA_BRIDGE_CLI_HARDENING",
-          "description": "Set to 1 to enforce the CLI action allowlist (recommended on shared hosts).",
+          "description": "Exact-form CLI allowlist on action=cli. Default on (NAS-227). Set 0/false/off for warn-only migration.",
           "isRequired": false
         }
       ]
