@@ -1,6 +1,6 @@
 {
   "name": "orca-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "External MCP server for controlling Orca (worktrees, sessions, orchestration)",
   "type": "module",
   "mcpName": "io.github.buildcontext/orca-mcp",
@@ -51,7 +51,6 @@
     "lib/state-ownership.mjs",
     "lib/toolsets.mjs",
     "scripts/",
-
     "docs/",
     "COORDINATOR.md",
     "deploy/",
