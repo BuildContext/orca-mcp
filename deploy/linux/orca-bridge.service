@@ -1,7 +1,7 @@
 [Unit]
 Description=orca-mcp — external MCP server for Orca
-After=network-online.target
-Wants=network-online.target
+After=network-online.target orca-bridge-store-signer.service
+Wants=network-online.target orca-bridge-store-signer.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -12,6 +12,9 @@ Type=simple
 # into this account's HOME and must stay owned by it. See README § Linux.
 User=orca
 Group=orca
+# Members of orca-bridge-signer may open the store-signer socket (0660).
+# Worker uids must NOT be added to this group (NAS-249/253).
+SupplementaryGroups=orca-bridge-signer
 # Any directory the service account can read — state does NOT go here.
 WorkingDirectory=/opt/orca-mcp
 # MUST be the home of User= above (replace `orca` if you renamed the account).
@@ -21,6 +24,7 @@ Environment=HOME=/home/orca
 Environment=PATH=/home/orca/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Plain KEY=VALUE env file (mode 600). Token/origin stay on the host, not in git.
 EnvironmentFile=/etc/orca-mcp/env
+Environment=ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock
 # Long-running node directly — not run.sh/nohup (those exit after start).
 # Checkout install (repo owned by the service account):
 ExecStart=/usr/bin/node /opt/orca-mcp/server.mjs --port 8787

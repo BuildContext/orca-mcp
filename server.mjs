@@ -23,6 +23,8 @@
 //   ORCA_BRIDGE_SENDER_TERMINAL / ORCA_BRIDGE_FROM — pin headless orchestration sender
 //   ORCA_BRIDGE_SENDER_TITLE — title for auto-created coordinator tab (default orca-bridge-coordinator)
 //   ORCA_BRIDGE_SENDER_SHARED=1 — force all clients onto the env pin (single-tenant; multi-coord OFF)
+//   ORCA_BRIDGE_STORE_SIGNER_SOCKET — unix socket of the separate-uid store signer (NAS-249/253)
+//   ORCA_BRIDGE_STORE_SIGNER_KEY    — in-process HMAC key for tests/isolated HOME only (never production)
 //   HINDSIGHT_URL      — proxy target (default http://127.0.0.1:8888; HTTP mode)
 //   PORT               — listen port (default 8787; --port wins; HTTP mode only)
 //
@@ -119,6 +121,12 @@ import {
   listOwnedTerminalHandles,
   applyOwnershipListRedaction,
 } from './lib/state-ownership.mjs';
+import {
+  resolveStoreSigner,
+  readSignedJsonFile,
+  writeSignedJsonFile,
+  SIGNED_STORE_MISSING,
+} from './lib/store-signer.mjs';
 import { executeReleaseWorker } from './lib/release-worker.mjs';
 
 const execFile = promisify(execFileCb);
@@ -279,8 +287,6 @@ const coordinatorHandles = new Set();
  */
 const clientOwnership = new Map();
 const withClientOrchLock = createSerialLockMap();
-/** Persist pin handles across bridge restarts. */
-const SENDER_PIN_STORE = path.join(os.homedir(), '.orca-bridge-sender-pins.json');
 
 function ownershipFor(clientKey) {
   const k = clientKey || currentClientKey();
@@ -335,11 +341,53 @@ function isRunBound(runId, senderHandle) {
   );
 }
 
-function loadPersistedPins() {
+/** Persist pin handles across bridge restarts. */
+const SENDER_PIN_STORE = path.join(os.homedir(), '.orca-bridge-sender-pins.json');
+
+// Append-only audit log + in-memory dispatch/transcript registry for MCP resources.
+// Override dir with ORCA_BRIDGE_AUDIT_DIR; default ~/.orca-bridge/audit.ndjson
+const AUDIT_DIR = (process.env.ORCA_BRIDGE_AUDIT_DIR || '').trim()
+  || path.join(os.homedir(), '.orca-bridge');
+/**
+ * Separate-uid store signer (NAS-249 / NAS-253).
+ * Socket path in production; ORCA_BRIDGE_STORE_SIGNER_KEY only for tests/isolated HOME.
+ * Not keyed on runtimeId — bindings survive bridge and runtime restarts.
+ */
+const storeSigner = resolveStoreSigner();
+if (!storeSigner) {
+  console.error(
+    'WARN: no store signer configured (set ORCA_BRIDGE_STORE_SIGNER_SOCKET or ' +
+      'ORCA_BRIDGE_STORE_SIGNER_KEY); pin/ownership store writes will fail closed',
+  );
+}
+
+/**
+ * Load sender pins. File must be signed by the store signer (NAS-253).
+ * Unsigned / foreign-key / corrupt → reject entire file (empty pins), not warn-and-accept.
+ */
+async function loadPersistedPins() {
   try {
-    if (!fs.existsSync(SENDER_PIN_STORE)) return;
-    const raw = JSON.parse(fs.readFileSync(SENDER_PIN_STORE, 'utf8'));
-    if (!raw || typeof raw !== 'object') return;
+    if (!storeSigner) {
+      if (fs.existsSync(SENDER_PIN_STORE)) {
+        console.error('WARN: sender pins rejected: store signer unavailable');
+      }
+      return 0;
+    }
+    const res = await readSignedJsonFile(SENDER_PIN_STORE, storeSigner);
+    if (!res.ok) {
+      if (res.reason === SIGNED_STORE_MISSING) return 0;
+      console.error(
+        `WARN: sender pins rejected (${res.reason}${res.error ? `: ${res.error}` : ''}); ` +
+          'unsigned/corrupt/foreign-key store is not loaded',
+      );
+      return 0;
+    }
+    const raw = res.payload;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      console.error('WARN: sender pins rejected: malformed payload');
+      return 0;
+    }
+    let n = 0;
     for (const [k, v] of Object.entries(raw)) {
       if (v && typeof v.handle === 'string' && v.handle) {
         senderCaches.set(k, {
@@ -349,19 +397,33 @@ function loadPersistedPins() {
           title: v.title || undefined,
         });
         rememberCoordinatorHandle(v.handle);
+        n += 1;
       }
     }
+    return n;
   } catch (e) {
-    console.error('WARN: cannot load sender pins:', e.message);
+    console.error('WARN: sender pins rejected:', e.message);
+    return 0;
   }
 }
 
-function persistSenderPin(clientKey, { handle, title, source } = {}) {
+async function persistSenderPin(clientKey, { handle, title, source } = {}) {
   if (!clientKey || !handle) return;
+  if (!storeSigner) {
+    console.error('WARN: cannot persist sender pin: store signer unavailable');
+    return;
+  }
+  // Read-merge current signed store; reject unsigned so a forged base cannot be extended.
   let all = {};
   try {
-    if (fs.existsSync(SENDER_PIN_STORE)) {
-      all = JSON.parse(fs.readFileSync(SENDER_PIN_STORE, 'utf8')) || {};
+    const existing = await readSignedJsonFile(SENDER_PIN_STORE, storeSigner);
+    if (existing.ok && existing.payload && typeof existing.payload === 'object' && !Array.isArray(existing.payload)) {
+      all = { ...existing.payload };
+    } else if (existing.reason && existing.reason !== SIGNED_STORE_MISSING) {
+      console.error(
+        `WARN: sender pin store unreadable for merge (${existing.reason}); writing sole pin for ${clientKey}`,
+      );
+      all = {};
     }
   } catch {
     all = {};
@@ -373,13 +435,15 @@ function persistSenderPin(clientKey, { handle, title, source } = {}) {
     at: new Date().toISOString(),
   };
   try {
-    // Ownership-preserving: a root-run upgrade must not orphan the service
-    // account's pin store (see lib/state-ownership.mjs, NAS-241).
-    const res = writeFilePreservingOwner(SENDER_PIN_STORE, JSON.stringify(all), {
-      mode: STATE_FILE_MODE,
-    });
-    if (res.chownError) {
-      console.error(`WARN: sender pin store owner not restored (${res.chownError}); ` +
+    const res = await writeSignedJsonFile(SENDER_PIN_STORE, all, storeSigner);
+    if (!res.ok) {
+      console.error(
+        `WARN: cannot persist sender pin (${res.reason}${res.error ? `: ${res.error}` : ''})`,
+      );
+      return;
+    }
+    if (res.write && res.write.chownError) {
+      console.error(`WARN: sender pin store owner not restored (${res.write.chownError}); ` +
         `chown it back to the service user or the bridge loses its pins after restart`);
     }
   } catch (e) {
@@ -387,24 +451,23 @@ function persistSenderPin(clientKey, { handle, title, source } = {}) {
   }
 }
 
-loadPersistedPins();
-
-// Append-only audit log + in-memory dispatch/transcript registry for MCP resources.
-// Override dir with ORCA_BRIDGE_AUDIT_DIR; default ~/.orca-bridge/audit.ndjson
-const AUDIT_DIR = (process.env.ORCA_BRIDGE_AUDIT_DIR || '').trim()
-  || path.join(os.homedir(), '.orca-bridge');
 const auditLog = createAuditLog({ dir: AUDIT_DIR });
 const dispatchRegistry = createDispatchRegistry();
 
 /**
- * Durable dispatch ownership bindings (NAS-248 P0 #4).
+ * Durable dispatch ownership bindings (NAS-248 P0 #4 + NAS-249).
  * Survives bridge process restart so coordinators can still release workers they
  * legitimately dispatched. Never written from await/check claim paths — only from
- * dispatch-time bindOwner / hydrate. Not keyed on runtimeId.
+ * dispatch-time bindOwner / hydrate. Not keyed on runtimeId. HMAC-signed via the
+ * separate-uid store signer — unsigned/forged files are rejected on load.
  */
 const OWNERSHIP_STORE = path.join(AUDIT_DIR, 'dispatch-ownership.json');
 
-function persistOwnershipBindings() {
+async function persistOwnershipBindings() {
+  if (!storeSigner) {
+    console.error('WARN: cannot persist dispatch ownership: store signer unavailable');
+    return;
+  }
   try {
     if (!fs.existsSync(AUDIT_DIR)) {
       fs.mkdirSync(AUDIT_DIR, { recursive: true, mode: 0o700 });
@@ -414,14 +477,16 @@ function persistOwnershipBindings() {
       updatedAt: new Date().toISOString(),
       bindings: dispatchRegistry.listOwnershipBindings(),
     };
-    const res = writeFilePreservingOwner(
-      OWNERSHIP_STORE,
-      JSON.stringify(payload, null, 2),
-      { mode: STATE_FILE_MODE },
-    );
-    if (res.chownError) {
+    const res = await writeSignedJsonFile(OWNERSHIP_STORE, payload, storeSigner);
+    if (!res.ok) {
       console.error(
-        `WARN: ownership store owner not restored (${res.chownError}); ` +
+        `WARN: cannot persist dispatch ownership (${res.reason}${res.error ? `: ${res.error}` : ''})`,
+      );
+      return;
+    }
+    if (res.write && res.write.chownError) {
+      console.error(
+        `WARN: ownership store owner not restored (${res.write.chownError}); ` +
           `chown it back to the service user or release-after-restart will fail closed`,
       );
     }
@@ -433,11 +498,26 @@ function persistOwnershipBindings() {
 /**
  * Hydrate registry + clientOwnership from durable bindings after process restart.
  * bindOwner refuses reassignment — first writer wins.
+ * File must verify under the store signer (NAS-249); forge → zero bindings.
  */
-function loadPersistedOwnership() {
+async function loadPersistedOwnership() {
   try {
-    if (!fs.existsSync(OWNERSHIP_STORE)) return 0;
-    const raw = JSON.parse(fs.readFileSync(OWNERSHIP_STORE, 'utf8'));
+    if (!storeSigner) {
+      if (fs.existsSync(OWNERSHIP_STORE)) {
+        console.error('WARN: dispatch ownership rejected: store signer unavailable');
+      }
+      return 0;
+    }
+    const res = await readSignedJsonFile(OWNERSHIP_STORE, storeSigner);
+    if (!res.ok) {
+      if (res.reason === SIGNED_STORE_MISSING) return 0;
+      console.error(
+        `WARN: dispatch ownership rejected (${res.reason}${res.error ? `: ${res.error}` : ''}); ` +
+          'unsigned/corrupt/foreign-key store is not loaded',
+      );
+      return 0;
+    }
+    const raw = res.payload;
     const bindings = Array.isArray(raw?.bindings)
       ? raw.bindings
       : Array.isArray(raw)
@@ -474,7 +554,7 @@ function loadPersistedOwnership() {
     }
     return n;
   } catch (e) {
-    console.error('WARN: cannot load dispatch ownership:', e.message);
+    console.error('WARN: dispatch ownership rejected:', e.message);
     return 0;
   }
 }
@@ -483,7 +563,7 @@ function loadPersistedOwnership() {
  * Authoritative dispatch-time ownership bind + durable persist.
  * The only path that may create a clientKey binding for a dispatch id.
  */
-function bindOwnedDispatch({
+async function bindOwnedDispatch({
   runId,
   dispatchId,
   terminalHandle,
@@ -526,11 +606,13 @@ function bindOwnedDispatch({
     taskId,
     clientKey: ck,
   });
-  persistOwnershipBindings();
+  await persistOwnershipBindings();
   return bound;
 }
 
-const _ownershipHydrated = loadPersistedOwnership();
+// Top-level await is valid in this ESM module; hydrate before accepting traffic.
+await loadPersistedPins();
+const _ownershipHydrated = await loadPersistedOwnership();
 if (_ownershipHydrated > 0) {
   console.error(`orca-bridge: restored ${_ownershipHydrated} durable dispatch ownership binding(s)`);
 }
@@ -1161,7 +1243,7 @@ async function resolveSenderTerminal({ force = false } = {}) {
     });
     // Persist so bridge restart reuses the same handle (keeps run binding).
     if (source === 'created' || source === 'pinned' || source === 'persisted' || source === 'title' || source === 'env' || source === 'env-shared' || source === 'title-suffix') {
-      persistSenderPin(clientKey, { handle, title, source });
+      await persistSenderPin(clientKey, { handle, title, source });
     }
     return {
       handle,
@@ -1275,7 +1357,7 @@ async function resolveSenderTerminal({ force = false } = {}) {
     source: 'created',
     title: clientTitle,
   });
-  persistSenderPin(clientKey, { handle, title: clientTitle, source: 'created' });
+  await persistSenderPin(clientKey, { handle, title: clientTitle, source: 'created' });
   return { handle, source: 'created', clientKey, title: clientTitle };
 }
 
@@ -1730,7 +1812,7 @@ async function dispatchWorker(args = {}) {
 
   // Authoritative ownership bind at dispatch-time only (NAS-248 P0 #4).
   // await/check must never create or reassign clientKey bindings.
-  bindOwnedDispatch({
+  await bindOwnedDispatch({
     runId,
     dispatchId: dispatchId || null,
     terminalHandle: handle,

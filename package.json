@@ -49,6 +49,7 @@
     "lib/security-core.mjs",
     "lib/runtime-guard.mjs",
     "lib/state-ownership.mjs",
+    "lib/store-signer.mjs",
     "lib/toolsets.mjs",
     "scripts/",
     "docs/",
