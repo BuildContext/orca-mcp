@@ -120,6 +120,13 @@ import {
   applyOwnershipListRedaction,
 } from './lib/state-ownership.mjs';
 import { executeReleaseWorker } from './lib/release-worker.mjs';
+import {
+  resolveWorkerIsolationConfig,
+  planIsolatedAgentPlacement,
+  buildIsolatedTerminalCreateArgv,
+  mintWorkerCapability,
+  workerIsolationHealth,
+} from './lib/worker-isolation.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -166,6 +173,8 @@ const SENDER_SHARED = process.env.ORCA_BRIDGE_SENDER_SHARED === '1';
 // Precedence: --read-only > ORCA_BRIDGE_TOOLSETS > default-all.
 // ORCA_BRIDGE_CLI_ADMIN=1 unions admin into the enabled set (ignored under --read-only).
 const TOOLSET_GATE = createToolsetGate({ env: process.env, argv: process.argv });
+// NAS-255: dedicated worker uid (opt-in). Off by default — same-uid legacy.
+const WORKER_ISOLATION = resolveWorkerIsolationConfig(process.env);
 // Opt-in cli allowlist. Default permissive (hardening off).
 // ORCA_BRIDGE_CLI_HARDENING=1 enforces deny-by-default allowlist.
 // Admin unlock follows the effective toolset admin bit (toolset collapse).
@@ -1381,7 +1390,7 @@ function looksWorking(snap) {
  * If inject did not land in TUI (common for grok: accepted but Turns:0 idle),
  * push the task text via terminal send + Enter, with worker_done recovery trailer.
  */
-async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent }) {
+async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent, workerCapability = null }) {
   const settleMs = Number(process.env.ORCA_BRIDGE_INJECT_SETTLE_MS || 10_000);
   const probes = [];
   await sleep(Math.min(Math.max(settleMs, 3_000), 25_000));
@@ -1393,6 +1402,9 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent }) {
   }
 
   // Still idle — send recovery prompt (spec + ids + worker_done contract)
+  const capLine = workerCapability
+    ? `ORCA_WORKER_CAPABILITY is set for this dispatch (NAS-255 worker uid).\n`
+    : '';
   const recovery =
     `${spec}\n\n` +
     `[coordinator inject-recovery] Dispatch inject may not have landed in this TUI (idle Turns:0). ` +
@@ -1400,6 +1412,7 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent }) {
     `task_id: ${taskId}\n` +
     `dispatch_id: ${dispatchId || '(unknown)'}\n` +
     `agent: ${agent}\n` +
+    capLine +
     `When finished, send exactly one:\n` +
     `orca orchestration send --type worker_done --subject "done" --body "<3 sentences>" ` +
     `--task-id ${taskId}` +
@@ -1563,11 +1576,115 @@ async function dispatchWorker(args = {}) {
   }
 
   // 3) Place agent terminal
+  // NAS-255: when worker isolation is active, never pass --agent to worktree
+  // create (Orca would spawn as the bridge uid). Create the worktree bare, then
+  // terminal create --command <wrapper agent> so the agent runs as orca-worker.
   let handle = '';
   let worktreePath = null;
   let worktreeId = null;
+  let workerLaunchCommand = null;
 
-  if (worktree === 'current') {
+  const isolationPlan = planIsolatedAgentPlacement(
+    {
+      worktree,
+      agent,
+      name: name || autoName('ha'),
+      repo: repo || '',
+      setup,
+      baseBranch,
+    },
+    WORKER_ISOLATION,
+  );
+
+  if (isolationPlan.mode === 'isolated-command') {
+    workerLaunchCommand = isolationPlan.launchCommand;
+    if (worktree === 'current') {
+      const termArgv = isolationPlan.terminalArgv;
+      const termRes = await runJson(termArgv, { timeoutMs: WORKER_START_TIMEOUT_MS });
+      steps.push({ step: 'terminal-create-isolated', launchCommand: workerLaunchCommand, ...termRes });
+      if (!envOk(termRes)) {
+        return {
+          ok: false,
+          stage: 'terminal-create',
+          run_id: runId,
+          task_id: taskId,
+          error: 'terminal create (worker-uid wrapper) failed',
+          worker_isolation: workerIsolationHealth(WORKER_ISOLATION),
+          steps,
+        };
+      }
+      const tr = termRes.envelope?.result || {};
+      handle =
+        pick(tr, 'handle') ||
+        pick(tr.terminal, 'handle') ||
+        pick(tr, 'agentTerminalHandle') ||
+        '';
+    } else {
+      if (!repo) {
+        return {
+          ok: false,
+          stage: 'worktree-create',
+          run_id: runId,
+          task_id: taskId,
+          error: 'repo is required for new worktree (pass repo or set ORCA_BRIDGE_DEFAULT_REPO)',
+          steps,
+        };
+      }
+      const wtArgv = isolationPlan.worktreeArgv;
+      const wtRes = await runJson(wtArgv, { timeoutMs: WORKER_START_TIMEOUT_MS });
+      steps.push({ step: 'worktree-create-isolated', ...wtRes });
+      if (!envOk(wtRes)) {
+        return {
+          ok: false,
+          stage: 'worktree-create',
+          run_id: runId,
+          task_id: taskId,
+          error: 'worktree create (no --agent; worker-uid path) failed',
+          steps,
+        };
+      }
+      const wr = wtRes.envelope?.result || {};
+      worktreePath = pick(wr, 'path') || pick(wr.worktree, 'path') || null;
+      worktreeId = pick(wr, 'id') || null;
+      const wtSel = worktreePath
+        ? (String(worktreePath).startsWith('path:') ? String(worktreePath) : `path:${worktreePath}`)
+        : (worktreeId ? String(worktreeId) : null);
+      if (!wtSel) {
+        return {
+          ok: false,
+          stage: 'place-agent',
+          run_id: runId,
+          task_id: taskId,
+          error: 'isolated worktree create returned no path/id for terminal create',
+          steps,
+        };
+      }
+      const termArgv = buildIsolatedTerminalCreateArgv({
+        worktreeSelector: wtSel,
+        name: name || autoName('ha'),
+        launchCommand: workerLaunchCommand,
+      });
+      const termRes = await runJson(termArgv, { timeoutMs: WORKER_START_TIMEOUT_MS });
+      steps.push({ step: 'terminal-create-isolated', launchCommand: workerLaunchCommand, ...termRes });
+      if (!envOk(termRes)) {
+        return {
+          ok: false,
+          stage: 'terminal-create',
+          run_id: runId,
+          task_id: taskId,
+          error: 'terminal create (worker-uid wrapper) failed after isolated worktree',
+          worktree: worktreePath,
+          steps,
+        };
+      }
+      const tr = termRes.envelope?.result || {};
+      handle =
+        pick(tr, 'handle') ||
+        pick(tr.terminal, 'handle') ||
+        pick(tr, 'agentTerminalHandle') ||
+        '';
+    }
+  } else if (worktree === 'current') {
     if (!repo) {
       return {
         ok: false,
@@ -1653,7 +1770,7 @@ async function dispatchWorker(args = {}) {
     worktreeId = pick(wr, 'id') || null;
   }
 
-  if (!handle) {
+    if (!handle) {
     return {
       ok: false,
       stage: 'place-agent',
@@ -1694,7 +1811,21 @@ async function dispatchWorker(args = {}) {
   const dr = dispRes.envelope?.result || {};
   const dispatchId = pick(dr.dispatch, 'id') || pick(dr, 'dispatchId', 'dispatch_id');
 
-  // 6) Inject liveness (Grok/others: inject accepted but TUI stays Turns:0)
+  // 6) Mint worker capability (NAS-255) then inject liveness recovery.
+  let workerCapability = null;
+  if (WORKER_ISOLATION.enabled && WORKER_ISOLATION.hmacSecret && dispatchId && taskId) {
+    try {
+      workerCapability = mintWorkerCapability({
+        dispatchId,
+        taskId,
+        terminalHandle: handle,
+        clientKey: currentClientKey(),
+      }, WORKER_ISOLATION.hmacSecret);
+    } catch (e) {
+      steps.push({ step: 'worker-capability', error: String(e?.message || e) });
+    }
+  }
+
   // Skip only if ORCA_BRIDGE_INJECT_RECOVERY=0
   let injectRecovery = { recovered: false, landed: true, probes: [], skipped: false };
   if (process.env.ORCA_BRIDGE_INJECT_RECOVERY === '0') {
@@ -1707,6 +1838,7 @@ async function dispatchWorker(args = {}) {
         dispatchId,
         spec,
         agent,
+        workerCapability,
       });
       steps.push({
         step: 'inject-liveness',
@@ -1742,7 +1874,7 @@ async function dispatchWorker(args = {}) {
   });
 
 
-  return {
+    return {
     ok: true,
     stage: 'ready',
     run_id: runId,
@@ -1759,6 +1891,11 @@ async function dispatchWorker(args = {}) {
     inject_recovered: injectRecovery.recovered === true,
     inject_landed: injectRecovery.landed,
     client_key: currentClientKey(),
+    worker_isolation: workerIsolationHealth(WORKER_ISOLATION),
+    worker_launch_command: workerLaunchCommand,
+    worker_capability_minted: Boolean(workerCapability),
+    // Capability is for the worker process env (wrapper); not echoed in full to coordinators.
+    worker_capability_len: workerCapability ? workerCapability.length : 0,
     next: {
       action: 'await',
       detail:
@@ -2317,6 +2454,7 @@ async function healthPayload({ verbose = false } = {}) {
       note:
         '0.2.13+: pin-by-handle + persist; await skips run-use when already bound (ack-safe); ' +
         'two coordinators need two OAuth tokens. ORCA_BRIDGE_SENDER_SHARED=1 = single-tenant only.',
+      workerUid: workerIsolationHealth(WORKER_ISOLATION),
     },
     hindsightTarget: HINDSIGHT_URL.href,
     actions: ['health', 'dispatch', 'await', 'release', 'guide', 'check', 'cli'],
