@@ -25,6 +25,11 @@ Environment=PATH=/home/orca/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Plain KEY=VALUE env file (mode 600). Token/origin stay on the host, not in git.
 EnvironmentFile=/etc/orca-mcp/env
 Environment=ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock
+# NAS-255 (opt-in worker uid): merge deploy/linux worker-isolation.env fragment
+# after install-worker-uid.sh. Bridge stays User=orca; agents run as orca-worker
+# via ORCA_BRIDGE_WORKER_LAUNCH_WRAPPER. Do NOT add the worker to a shared group
+# with this account — that re-opens the secret class. Per-dispatch uid is NOT
+# shipped. See docs/runbooks/nas-255-worker-uid.md.
 # Long-running node directly — not run.sh/nohup (those exit after start).
 # Checkout install (repo owned by the service account):
 ExecStart=/usr/bin/node /opt/orca-mcp/server.mjs --port 8787

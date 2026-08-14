@@ -131,12 +131,14 @@ MCP security guidance (official best practices and the above advisories) converg
 | Audit log | **On** (dir configurable) | Redacted append-only NDJSON + MCP resources |
 | OAuth + PKCE (HTTP) | Available | Master token stays out of remote client settings when OAuth is used |
 | Per-OAuth-client sender isolation | On (unless shared pin) | `lib/orch-isolation.mjs` |
+| Dedicated worker uid (NAS-255) | **Opt-in** | `ORCA_BRIDGE_WORKER_ISOLATION=1` + `lib/worker-isolation.mjs` + deploy/linux wrappers; FS 0600 bridge-owned secrets |
 | CLI exact-form allowlist | **On** (NAS-227); `0`/`false`/`off` = warn-only | `ORCA_BRIDGE_CLI_HARDENING` |
 | Capability toolsets | **Opt-in restrict** | `ORCA_BRIDGE_TOOLSETS`, `--read-only`; default = all tiers |
 
 ## Explicitly NOT mitigated
 
 - **No OS sandbox** (no container, seccomp, or FS jail imposed by the bridge)
+- **Per-dispatch worker uid / worker-to-worker isolation** — NAS-255 ships one shared worker account only (opt-in `ORCA_BRIDGE_WORKER_ISOLATION=1`). See [runbooks/nas-255-worker-uid.md](./runbooks/nas-255-worker-uid.md).
 - **Permissive toolset defaults** — admin toolset on; CLI exact-form hardening on
 - **No per-caller authorization** beyond “has a valid token/session”
 - **No guarantee** that agent-driven file writes, network calls, or git pushes are blocked
