@@ -253,7 +253,7 @@ Hyperagent custom MCP historically exports **one** tool name from this server
 `orca` via the `action` field. Multi-name `tools/list` does not help HA clients.
 
 Primary actions: `health`, `dispatch`, `await`, `release`, `guide`, plus lower
-level `check` / `cli`. Capability tiers and the opt-in CLI allowlist are
+level `check` / `cli`. Capability tiers and the default-on exact-form CLI allowlist are
 documented in the README (capability toolsets / CLI allowlist).
 
 ---
@@ -318,7 +318,7 @@ code, the service account owns the state.
 | `server.mjs` | HTTP/MCP server, dispatch/await/release, OAuth |
 | `lib/orch-isolation.mjs` | Pure multi-coordinator isolation helpers |
 | `lib/security-core.mjs` | Pure auth/CLI argv helpers (testable) |
-| `lib/cli-policy.mjs` | Opt-in `action=cli` allowlist |
+| `lib/cli-policy.mjs` | Default-on exact-form `action=cli` allowlist |
 | `lib/toolsets.mjs` | Capability tiers status/dispatch/admin |
 | `lib/state-ownership.mjs` | State-file ownership guards (root-safe writes, boot check) |
 | `COORDINATOR.md` | Operator discipline (also `action=guide`) |

@@ -63,12 +63,12 @@ The bridge **appends** a `worker_done` contract itself. Still spell out in the b
 
 `terminal read --limit N` is for liveness/debug, not a substitute for `await`.
 
-## Raw `cli` — when it is OK
+## Raw `cli` — exact-form contract
 
-- orchestration reply (questions)
-- skills get, status, worktree show/list
-- terminal list/read/close/send for YOUR keep-list handles only (shell: one `--text … --enter`; TUI compose box: that plus a following empty `--enter`; `--interrupt` to break a stuck TUI; no `--submit`)
-- worker-show / worker-read on escalation
+- CONTRACT (NAS-254): `action=cli` admits only an **exact command form** — exact command path (never a prefix hit) + only the flags listed for that path + the value grammar below. Short options fail closed. Hardening is ON by default (NAS-227). Globals on every form: `--help --json --pairing-code --environment`.
+- Value grammar: `orchestration check` refuses `--peek` together with `--all` (exactly one read mode). `worktree create --agent --prompt` is always-on `forbidden_handoff` (use `action=dispatch`). Ownership of `--terminal` / `--dispatch` / `--worktree` / `--task` / `--run` / `--id` selectors is independent of the hatch — foreign targets deny either way.
+- OK-tier (default surface, no admin unlock): `status`; `worktree list` (`--repo --limit`); `worktree show` (`--worktree`); `terminal list` (`--worktree --limit --include-visual-layouts`); `terminal read` (`--terminal --cursor --limit`); `terminal close` (`--terminal --tab`); `skills get` (alias `skills show`; positional `topic` / `--topic --full`); `orchestration check` (`--terminal --run --ack --unread --peek --all --types --format --wait --timeout-ms --retry-request`; peek⊕all mutex); `orchestration reply` (`--id --body --run --from --retry-request`); `orchestration worker-show` (`--dispatch`); `orchestration worker-read` (`--dispatch --source --cursor --limit`); `orchestration dispatch-show` (`--task --preamble --from`).
+- ADMIN-tier (admin toolset / `ORCA_BRIDGE_CLI_ADMIN=1`): `terminal send` (`--terminal --text --enter --interrupt`; shell: one `--text … --enter`; TUI compose box: that plus a following empty `--enter`; `--interrupt` if stuck; no `--submit`); `terminal create` (`--worktree --command --title --focus`); `worktree create` (`--repo --project --host --project-host-setup --name --agent --prompt --base-branch --issue --linear-issue --comment --setup --parent-worktree --no-parent --run-hooks --activate`); `worktree rm` (aliases `remove`/`delete`; `--worktree --force --run-hooks`); `orchestration send` (`--to --run --from --subject --body --type --priority --thread-id --payload --task-id --dispatch-id --dispatch-capability --retry-request --outcome --files-modified --report-path --phase`); `orchestration task-create` (`--spec --task-title --display-name --deps --parent --run --from --retry-request`); `orchestration worker-start` (`--task --on --worktree --name --repo --base-branch --display-name --comment --setup --agent --model --effort --terminal --retry-of --timeout-ms --run --from --retry-request`); `orchestration dispatch` (`--task --to --from --run --inject --dry-run --return-preamble --retry-request`); `orchestration run-create` (`--objective --from --retry-request`); `orchestration run-use` (`--id --from --takeover-legacy --retry-request`). Anything else denies and does not spawn.
 
 Not allowed:
 

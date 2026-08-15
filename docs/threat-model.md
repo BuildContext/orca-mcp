@@ -160,7 +160,7 @@ MCP security guidance (official best practices and the above advisories) converg
 | Path | Role |
 | --- | --- |
 | `lib/security-core.mjs` | Handoff gate, `tokenMatches`, `authenticateRequest`, argv builders |
-| `lib/cli-policy.mjs` | Opt-in allowlist; permissive default + warnings |
+| `lib/cli-policy.mjs` | Exact-form allowlist; default ON (NAS-227); `0`/`false`/`off` = deprecated warn-only |
 | `lib/toolsets.mjs` | status / dispatch / admin tiers |
 | `lib/audit.mjs` | Redaction + append-only log + annotations |
 | `lib/orch-isolation.mjs` | Multi-coordinator pins, mailbox partition, release guard |

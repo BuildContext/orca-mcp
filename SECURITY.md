@@ -76,7 +76,7 @@ We want private reports for issues such as:
 The following are **not** vulnerabilities in this project:
 
 - **An authenticated caller doing what the tool is designed to do.** With a valid token (or equivalent auth), `dispatch`, `cli`, worktree/terminal operations, and agent control are the product. That includes spawning agents, writing files via those agents, and running Orca CLI that the host user can already run.
-- **Default-open toolsets.** By design, toolsets default to `{status,dispatch,admin}`. CLI exact-form hardening is **on** by default (NAS-227); operators may set `ORCA_BRIDGE_CLI_HARDENING=0` only for migration. Leaving admin toolset enabled on a shared host is still a trusted-coordinator deploy.
+- **Default-open toolsets.** By design, toolsets default to `{status,dispatch,admin}` (NAS-226). CLI exact-form hardening is **on** by default (NAS-227); operators may set `ORCA_BRIDGE_CLI_HARDENING=0` only for migration. Leaving admin toolset enabled on a shared host is still a trusted-coordinator deploy.
 - **Lack of OS sandboxing.** The bridge does not isolate filesystem, network, or process namespace. It runs as the host user (or service user) and inherits that user's powers.
 - **Compromise of the host user account, MCP client, or Orca binary** outside the bridge — stolen laptop, malicious local process reading `ORCA_BRIDGE_TOKEN` from the environment, compromised `orca`/`orca-ide` binary.
 - **Social engineering / prompt injection against a model** that an *already authenticated* coordinator chooses to trust, except where you can show a **bridge bug** that bypasses a documented control (e.g. handoff gate bypass).
