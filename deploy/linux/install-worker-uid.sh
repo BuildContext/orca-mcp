@@ -86,10 +86,23 @@ for g in ${WORKER_GROUPS}; do
   done
 done
 
-# 2) install wrappers
+# 2) install wrappers, seed helper, PATH entry, tmpfiles
 run install -d -m 0755 "${LIB_DIR}"
 run install -m 0755 "${SCRIPT_DIR}/orca-omp-as-worker.sh" "${LIB_DIR}/orca-omp-as-worker.sh"
 run install -m 0755 "${SCRIPT_DIR}/orca-worker-orch.sh" "${LIB_DIR}/orca-worker-orch.sh"
+run install -m 0755 "${SCRIPT_DIR}/orca-seed-worker-creds" "${LIB_DIR}/orca-seed-worker-creds"
+# Worker-facing orca on the sudo secure_path. 994 has no ~/.local/bin.
+if [[ -f /usr/local/bin/orca && ! -f /usr/local/bin/orca.pre-nas258-cap ]]; then
+  run cp -a /usr/local/bin/orca /usr/local/bin/orca.pre-nas258-cap
+fi
+run install -m 0755 "${SCRIPT_DIR}/orca-as-worker" /usr/local/bin/orca
+if [[ -f "${SCRIPT_DIR}/tmpfiles-orca-mcp-worker-caps.conf" ]]; then
+  run install -m 0644 "${SCRIPT_DIR}/tmpfiles-orca-mcp-worker-caps.conf" \
+    /etc/tmpfiles.d/orca-mcp-worker-caps.conf
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    systemd-tmpfiles --create /etc/tmpfiles.d/orca-mcp-worker-caps.conf || true
+  fi
+fi
 
 # 3) sudoers
 tmp="$(mktemp)"
@@ -106,6 +119,17 @@ else
   install -m 0440 "${tmp}" "${SUDOERS_DST}"
   rm -f "${tmp}"
   visudo -cf "${SUDOERS_DST}"
+fi
+
+# NAS-258 uses a separate, exact-command sudoers fragment. Do not merge it
+# into the worker-launch allowlist: no argument wildcards or SETENV are allowed.
+SEED_SUDOERS_DST="/etc/sudoers.d/orca-mcp-seed-creds"
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  echo "+ install NAS-258 sudoers → ${SEED_SUDOERS_DST}"
+  cat "${SCRIPT_DIR}/orca-mcp-seed-creds.sudoers"
+else
+  install -m 0440 "${SCRIPT_DIR}/orca-mcp-seed-creds.sudoers" "${SEED_SUDOERS_DST}"
+  visudo -cf "${SEED_SUDOERS_DST}"
 fi
 
 # 4) worktree / repo access without shared group:

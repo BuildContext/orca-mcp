@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.3.3 — 2026-08-15
+## 0.3.4 — 2026-08-15
+
+### Added
+
+- **NAS-258:** mint a per-dispatch worker capability as a file, not env.
+  Isolated dispatch returns `worker_capability_minted: true` and
+  `worker_capability_file: /run/orca-mcp/worker-caps/<dispatchId>.json`.
+  The privileged seed helper materializes that file as uid 994 / mode 0600.
+  `action=release` writes a per-dispatch purge marker and reports
+  `credential_purge.cap.ok`. The HMAC-gated `POST /worker/orch` relay lets
+  uid 994 send `worker_done` / ask / check / heartbeat / escalation without
+  the bridge bearer token. Capability bytes are never echoed to coordinators.
+
 
 ### Fixed
 

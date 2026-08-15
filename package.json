@@ -1,6 +1,6 @@
 {
   "name": "orca-mcp",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "External MCP server for controlling Orca (worktrees, sessions, orchestration)",
   "type": "module",
   "mcpName": "io.github.buildcontext/orca-mcp",
@@ -53,6 +53,8 @@
     "lib/store-signature-migrate.mjs",
     "lib/toolsets.mjs",
     "lib/worker-isolation.mjs",
+    "lib/worker-cap-file.mjs",
+    "lib/worker-orch-relay.mjs",
     "lib/release-worker.mjs",
     "lib/cli-argv-normalize.mjs",
     "scripts/",

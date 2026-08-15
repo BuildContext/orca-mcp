@@ -7,14 +7,14 @@
     "url": "https://github.com/BuildContext/orca-mcp",
     "source": "github"
   },
-  "version": "0.3.3",
+  "version": "0.3.4",
   "websiteUrl": "https://github.com/BuildContext/orca-mcp",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "orca-mcp",
-      "version": "0.3.3",
+      "version": "0.3.4",
       "transport": {
         "type": "stdio"
       },
@@ -55,7 +55,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/buildcontext/orca-mcp:0.3.3",
+      "identifier": "ghcr.io/buildcontext/orca-mcp:0.3.4",
       "transport": {
         "type": "stdio"
       },

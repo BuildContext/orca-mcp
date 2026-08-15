@@ -1,0 +1,4 @@
+# NAS-258 — bridge may invoke only the fixed credential seed helper verbs.
+# The worker account is intentionally absent.
+orca ALL=(root) NOPASSWD: /usr/local/lib/orca-mcp/orca-seed-worker-creds seed
+orca ALL=(root) NOPASSWD: /usr/local/lib/orca-mcp/orca-seed-worker-creds purge
