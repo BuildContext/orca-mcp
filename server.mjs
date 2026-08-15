@@ -36,7 +36,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFile as execFileCb } from 'node:child_process';
+import { execFile as execFileCb, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes } from 'node:crypto';
 import { URL, fileURLToPath } from 'node:url';
@@ -151,6 +151,8 @@ import {
   authorizeWorkerOrch,
   getArgFlag,
 } from './lib/worker-orch-relay.mjs';
+import { looksLikeAgentTui, isTemplateWorkerDone } from './lib/agent-tui.mjs';
+import { hardenIsolatedWorktree, inferExpectedGitdir } from './lib/worktree-acl.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -990,12 +992,6 @@ function summarizeMessages(messages = []) {
   const done = list.find((m) => msgType(m) === 'worker_done');
   const question = list.find((m) => msgType(m) === 'question');
   const escalation = list.find((m) => msgType(m) === 'escalation');
-  let primary = 'empty';
-  if (done) primary = 'worker_done';
-  else if (escalation) primary = 'escalation';
-  else if (question) primary = 'question';
-  else if (list.length) primary = 'messages';
-
   const extractDone = (m) => {
     if (!m) return null;
     const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
@@ -1011,10 +1007,30 @@ function summarizeMessages(messages = []) {
     };
   };
 
+  const extractedDone = extractDone(done);
+  let primary = 'empty';
+  let rejectedWorkerDone = undefined;
+  if (done) {
+    if (isTemplateWorkerDone({
+      subject: extractedDone?.subject,
+      body: extractedDone?.body,
+      filesModified: extractedDone?.filesModified,
+      payload: done.payload,
+    })) {
+      primary = 'fake_worker_done';
+      rejectedWorkerDone = 'template';
+    } else {
+      primary = 'worker_done';
+    }
+  } else if (escalation) primary = 'escalation';
+  else if (question) primary = 'question';
+  else if (list.length) primary = 'messages';
+
   return {
     status: primary,
     counts: byType,
-    worker_done: extractDone(done),
+    rejected_worker_done: rejectedWorkerDone,
+    worker_done: extractedDone,
     question: question
       ? {
           id: pick(question, 'id', 'messageId', 'message_id'),
@@ -1036,6 +1052,17 @@ function summarizeMessages(messages = []) {
 
 function nextStepForAwait(summary, { timedOut, deliveryId, livenessInfo = null } = {}) {
   // next.action is a HINT — summary.status wins if they disagree.
+  if (summary.status === 'fake_worker_done') {
+    return {
+      action: 'diagnose_fake_worker_done',
+      detail:
+        'summary.status=fake_worker_done — template or placeholder worker_done rejected. ' +
+        'Do not release as success. Inspect the worker tab; treat as a failed agent launch.',
+      deliveryId: deliveryId || null,
+      rejected_worker_done: summary.rejected_worker_done || 'template',
+      note: 'next.action is a hint; prefer summary.status if they disagree.',
+    };
+  }
   if (summary.status === 'worker_done') {
     return {
       action: 'release',
@@ -1462,8 +1489,10 @@ async function terminalSnapshot(handle) {
     (turns === 0 || turns === null) &&
     (toolCalls === 0 || toolCalls === null);
   const lastOutputAt = term.lastOutputAt || null;
+  const title = String(term.title || term.name || readTerm.title || readTerm.name || '');
   return {
     ok: envOk(show),
+    title,
     preview: preview.slice(-800),
     tailTail: tail.slice(-1200),
     turns,
@@ -1513,8 +1542,8 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent, wor
     `dispatch_id: ${dispatchId || '(unknown)'}\n` +
     `agent: ${agent}\n` +
     capLine +
-    `When finished, send exactly one:\n` +
-    `orca orchestration send --from ${handle} --type worker_done --subject "done" --body "<3 sentences>" ` +
+    `When finished, send exactly one worker_done (do not paste a shell one-liner).\n` +
+    `# example: orca orchestration send --from ${handle} --type worker_done --subject "done" --body "three sentences" ` +
     `--task-id ${taskId}` +
     (dispatchId ? ` --dispatch-id ${dispatchId}` : '') +
     ` --outcome succeeded --json\n` +
@@ -1842,6 +1871,37 @@ async function dispatchWorker(args = {}) {
           steps,
         };
       }
+      if (worktreePath) {
+        const expectedGitdir = inferExpectedGitdir(worktreePath);
+        const harden = hardenIsolatedWorktree(worktreePath, expectedGitdir, {
+          workerUser: WORKER_ISOLATION.workerUser,
+          setfacl: (args) => {
+            execFileSync('setfacl', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+          },
+        });
+        steps.push({
+          step: 'worktree-harden',
+          ok: harden.ok,
+          git: harden.git && { ok: harden.git.ok, code: harden.git.code },
+          acl: harden.acl && {
+            ok: harden.acl.ok,
+            skipped: harden.acl.skipped,
+            parentGranted: harden.acl.parentGranted,
+            gitGranted: harden.acl.gitGranted,
+          },
+        });
+        if (harden.git && harden.git.ok === false) {
+          return {
+            ok: false,
+            stage: 'worktree-harden',
+            run_id: runId,
+            task_id: taskId,
+            worktree: worktreePath,
+            error: harden.git.message || 'isolated worktree gitdir pointer is unsafe',
+            steps,
+          };
+        }
+      }
       const termArgv = buildIsolatedTerminalCreateArgv({
         worktreeSelector: wtSel,
         name: name || autoName('ha'),
@@ -2038,6 +2098,29 @@ async function dispatchWorker(args = {}) {
       { timeoutMs: 90_000 },
     );
     steps.push({ step: 'tui-idle', ...waitRes });
+    const tuiSnap = await terminalSnapshot(handle);
+    const tui = looksLikeAgentTui(tuiSnap);
+    steps.push({
+      step: 'agent-tui',
+      ok: tui.ok,
+      reason: tui.reason || null,
+      title: tuiSnap.title || '',
+    });
+    if (!tui.ok) {
+      return {
+        ok: false,
+        stage: 'agent-tui',
+        run_id: runId,
+        task_id: taskId,
+        dispatch_id: dispatchId || null,
+        terminal_handle: handle,
+        worktree: worktreePath,
+        error: `isolated agent TUI did not come up (${tui.reason || 'not_agent'})`,
+        agent_tui: tui,
+        worker_isolation: workerIsolationHealth(WORKER_ISOLATION),
+        steps,
+      };
+    }
     // Runtime preamble carries --from + --dispatch-capability (dcap_).
     // Isolated bind skipped --inject so the waiting wrapper never saw it;
     // deliver it now that grok is up.
@@ -2432,7 +2515,12 @@ async function awaitDispatch(args = {}) {
     if (!existing?.clientKey || String(existing.clientKey) !== ck) continue;
     const t = msgType(m);
     dispatchRegistry.upsert(didStr, {
-      status: t === 'worker_done' ? 'worker_done' : (t || 'message'),
+      status:
+        t === 'worker_done' && summary.status === 'fake_worker_done'
+          ? 'fake_worker_done'
+          : t === 'worker_done'
+            ? 'worker_done'
+            : (t || 'message'),
       runId,
       lastDeliveryId: deliveryId || null,
       lastMessageType: t || null,
@@ -2452,7 +2540,7 @@ async function awaitDispatch(args = {}) {
       deliveryId: deliveryId || pick(m, 'deliveryId', 'delivery_id') || null,
     });
   }
-  if (summary.worker_done?.dispatchId) {
+  if (summary.status !== 'fake_worker_done' && summary.worker_done?.dispatchId) {
     const didStr = String(summary.worker_done.dispatchId);
     if (owned.has(didStr)) {
       const existing = dispatchRegistry.get(didStr);
@@ -2624,7 +2712,7 @@ const TOOLS = [
         terminalHandle: {
           type: 'string',
           description:
-            'For release (inject path): terminal_handle from dispatch. Preferred cleanup = terminal close --tab.',
+            'For release (inject path): terminal_handle from dispatch. Preferred cleanup = terminal close --terminal <handle> --json (no --tab).',
         },
         taskId: { type: 'string', description: 'Optional task id for dispatch-show lookup on release' },
         // await / check

@@ -132,13 +132,18 @@ MCP security guidance (official best practices and the above advisories) converg
 | OAuth + PKCE (HTTP) | Available | Master token stays out of remote client settings when OAuth is used |
 | Per-OAuth-client sender isolation | On (unless shared pin) | `lib/orch-isolation.mjs` |
 | Dedicated worker uid (NAS-255) | **Opt-in** | `ORCA_BRIDGE_WORKER_ISOLATION=1` + `lib/worker-isolation.mjs` + deploy/linux wrappers; FS 0600 bridge-owned secrets |
+| Per-worktree ACL (NAS-259) | **On isolated dispatch** | Named + default `u:orca-worker:rwx` on that checkout only; parent `workspaces/` is never granted |
+| Gitdir pointer harden (NAS-266) | **On isolated dispatch** | `.git` must stay a regular `gitdir:` file; sticky 1775 + 0444 pointer so 994 cannot replace it |
+| Signed-store freshness (NAS-268) | **On** | Envelope v2 `{n,ts}`; signer-held monotonic `n`; stale MAC replay rejected |
 | CLI exact-form allowlist | **On** (NAS-227); `0`/`false`/`off` = warn-only | `ORCA_BRIDGE_CLI_HARDENING` |
 | Capability toolsets | **Opt-in restrict** | `ORCA_BRIDGE_TOOLSETS`, `--read-only`; default = all tiers |
 
 ## Explicitly NOT mitigated
 
 - **No OS sandbox** (no container, seccomp, or FS jail imposed by the bridge)
-- **Per-dispatch worker uid / worker-to-worker isolation** — NAS-255 ships one shared worker account only (opt-in `ORCA_BRIDGE_WORKER_ISOLATION=1`). See [runbooks/nas-255-worker-uid.md](./runbooks/nas-255-worker-uid.md).
+- **Per-dispatch worker uid** — still unshipped (`perDispatchUid: false`). Worker-to-worker isolation is **ACL-narrowed** (per-worktree grant at dispatch), not uid-split. Sibling workers that can guess another checkout path may still reach it if that tree's ACL remains. See [runbooks/nas-255-worker-uid.md](./runbooks/nas-255-worker-uid.md).
+- **Hostile file content committed as 997** — 994 writes the checkout; the bridge commits named paths after a gitdir assert. Bodies are not sanitized.
+- **Signer-uid compromise** — a principal who also holds the store-signer uid can reset the monotonic `n` counter. That is the trust root; it is not a worker escape.
 - **Permissive toolset defaults** — admin toolset on; CLI exact-form hardening on
 - **No per-caller authorization** beyond “has a valid token/session”
 - **No guarantee** that agent-driven file writes, network calls, or git pushes are blocked

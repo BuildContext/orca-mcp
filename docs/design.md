@@ -134,10 +134,13 @@ Disable with `ORCA_BRIDGE_INJECT_RECOVERY=0`. Settle window:
 
 On the inject path the Dispatch is already **completed** when `worker_done`
 arrives. `worker-release` often returns `dispatch_not_found` — that is
-**expected**, not a failure. Cleanup is `terminal close --tab` using the
-**worker** handle from the dispatch response (`mode=terminal-close`,
-`expected_for_inject_path: true`). Passing the coordinator sender handle here
-would kill the pin — refused by `releaseRefusesCoordinator`.
+**expected**, not a failure. Cleanup is `terminal close --terminal <handle> --json`
+(no `--tab`) using the **worker** handle from the dispatch response
+(`mode=terminal-close`, `expected_for_inject_path: true`). `tab_not_found` and
+`workspace_session_unavailable` are treated as already gone. Passing the
+coordinator sender handle here would kill the pin — refused by
+`releaseRefusesCoordinator`. Isolated commits are bridge-uid named-path
+`commitNamedPaths` after a gitdir assert; uid 994 never commits.
 
 ---
 
