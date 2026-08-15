@@ -20,7 +20,7 @@ harmless on a shell). Stuck TUI: `--interrupt` on the same command.
 `orchestration dispatch --inject` types the brief only; the bridge follows
 with `terminal send --enter` to submit it.
 
-State this plainly in tickets and reports: **per-dispatch uid / worker-to-worker isolation is NOT shipped.**
+State this plainly in tickets and reports: **per-dispatch uid / worker-to-worker isolation is NOT shipped.** NAS-259 variant 2 (per-worktree ACL at create) **is** shipped; a uid pool is a separate project.
 
 ## Why
 
@@ -157,8 +157,13 @@ racing read→sign→write — so migration runs only with the **bridge stopped*
    #   ORCA_BRIDGE_WORKER_ISOLATION=1
    #   ORCA_BRIDGE_WORKER_HMAC_SECRET=<hex>
    # merge other keys from /etc/orca-mcp/worker-isolation.env
-   setfacl -R -m u:orca-worker:rwx /home/orca/orca/workspaces
-   setfacl -R -d -m u:orca-worker:rwx /home/orca/orca/workspaces
+   # NAS-259 variant 2 / NAS-266: do NOT grant a recursive+default ACL on
+   # /home/orca/orca/workspaces. That paints every sibling tree and the
+   # checkout .git pointer. The bridge grants per-worktree ACL at create
+   # and strips the named ACL from .git. If a tree-wide grant is already
+   # present, strip it as uid 997 (orca) — see "Pre-existing worktrees".
+   setfacl -R -x u:orca-worker /home/orca/orca/workspaces
+   setfacl -R -k /home/orca/orca/workspaces
    # Prove FS denial before enabling:
    sudo -u orca-worker cat /home/orca/.orca-bridge-tokens.json          # must fail
    sudo -u orca-worker cat /home/orca/.orca-bridge-sender-pins.json      # must fail
@@ -178,7 +183,7 @@ racing read→sign→write — so migration runs only with the **bridge stopped*
    - `senderTerminal.ok` — **proves pins survived**; if this is false after cutover,
      the migrator did not run or the wrong HOME was migrated
    - When worker isolation enabled: `isolation.workerUid.enabled === true`,
-     `perDispatchUid === false`
+     `perDispatchUid === false`, `perWorktreeAcl === true`
 
 ### Migrator invocation (reference)
 
@@ -222,11 +227,14 @@ already applied) and you are enabling NAS-255 later.
    #   ORCA_BRIDGE_WORKER_HMAC_SECRET=<hex>
    # merge other keys from /etc/orca-mcp/worker-isolation.env
    ```
-3. **Repo/worktree ACLs** (example — adjust roots):
+3. **Repo/worktree ACLs** (NAS-259 variant 2 — per-worktree, not tree-wide):
    ```bash
-   setfacl -R -m u:orca-worker:rwx /home/orca/orca/workspaces
-   setfacl -R -d -m u:orca-worker:rwx /home/orca/orca/workspaces
-   # git objects: ensure worker can read the main repo + write worktrees
+   # Strip any leftover recursive/default grant. New trees get ACL from the
+   # bridge at worktree-create. Do not re-apply -R / -d on the workspaces root.
+   setfacl -R -x u:orca-worker /home/orca/orca/workspaces
+   setfacl -R -k /home/orca/orca/workspaces
+   # git objects: 994 stays checkout-write-only; 997 commits (NAS-262).
+   # Never ACL the shared .git (hooks → RCE as 997).
    ```
 4. **Prove FS denial before enabling**
    ```bash
@@ -241,12 +249,45 @@ already applied) and you are enabling NAS-255 later.
    sudo systemctl restart orca-bridge.service   # OWNER only
    ```
 6. **Smoke**
-   - `action=health` verbose → `isolation.workerUid.enabled === true`, `perDispatchUid === false`
+   - `action=health` verbose → `isolation.workerUid.enabled === true`, `perDispatchUid === false`, `perWorktreeAcl === true`
    - Dispatch a throwaway worker; on the host: `ps -o user,pid,cmd -C omp` shows `orca-worker`
    - From that worker uid: secret cats still fail
    - Coordinator await → worker_done → release still works
 
 Rollback: set `ORCA_BRIDGE_WORKER_ISOLATION=0` (or remove), restart bridge; agents return to same-uid launch. Leave the `orca-worker` account in place.
+
+## Pre-existing worktrees (operator, uid 997)
+
+The bridge **does not** rewrite ACLs on trees that already exist. 994 cannot
+`setfacl` on orca-owned files (`Operation not permitted`). After deploy, run
+this once as **orca** (no sudo):
+
+```bash
+WORKSPACES=/home/orca/orca/workspaces
+WORKER=orca-worker
+
+setfacl -R -x "u:${WORKER}" "${WORKSPACES}"
+setfacl -R -k "${WORKSPACES}"
+
+# Re-grant ONLY live in-flight worker checkouts, then strip the .git pointer:
+#   setfacl -m "u:${WORKER}:rwx" -d -m "u:${WORKER}:rwx" "$WT"
+#   find "$WT" -mindepth 1 -maxdepth 1 ! -name .git \
+#     -exec setfacl -R -m "u:${WORKER}:rwx" -d -m "u:${WORKER}:rwx" {} +
+#   setfacl -x "u:${WORKER}" "$WT/.git"
+#   chmod 0644 "$WT/.git"
+
+getfacl -p "${WORKSPACES}"
+# must NOT show default:user:orca-worker
+```
+
+Until the parent default is stripped, new files (including `.git` pointers)
+keep inheriting `u:orca-worker:rwx`. The create-time strip still removes it
+from **new** pointers; foreign trees stay writable until this pass.
+
+997 git in a worker checkout must go through `assertWorktreeGitdirPointer`
+(`GITDIR_POINTER_REFUSED` if `.git` is a directory, a symlink, or not
+`<repo>/.git/worktrees/<name>`). Compose `git add -- <paths>` only — never
+`git add -A`.
 
 ## Mac (backup contour) — cost, not this PR’s apply
 

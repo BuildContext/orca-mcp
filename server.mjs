@@ -139,6 +139,12 @@ import {
   workerIsolationHealth,
 } from './lib/worker-isolation.mjs';
 import {
+  hardenDispatchedWorktree,
+  revokeWorktreeWorkerAcl,
+  resolveRepoFilesystemPath,
+  inferRepoRootFromCheckout,
+} from './lib/worktree-harden.mjs';
+import {
   capStagePath,
   capPurgeMarkerPath,
   capFilePath,
@@ -1638,6 +1644,30 @@ async function markWorkerCapPurge(dispatchId) {
 }
 
 /**
+ * NAS-259 variant 2 + NAS-266: grant the worker ACL on this checkout only,
+ * strip the named ACL from the `.git` pointer, then verify the pointer.
+ * Fail-closed — do not start the agent on an unhardened tree.
+ */
+async function hardenWorktreeIfIsolated({ checkoutPath, repo, name }) {
+  if (!WORKER_ISOLATION.enabled || WORKER_ISOLATION.sameUid) {
+    return { ok: true, skipped: true, reason: 'isolation_inactive' };
+  }
+  const raw = String(checkoutPath || '').trim();
+  const checkout = resolveRepoFilesystemPath(raw) || (raw.startsWith('/') ? path.resolve(raw) : '');
+  if (!checkout) {
+    return { ok: false, error: 'no checkout path to harden' };
+  }
+  return hardenDispatchedWorktree({
+    checkoutPath: checkout,
+    repoRoot:
+      resolveRepoFilesystemPath(repo) || inferRepoRootFromCheckout(checkout),
+    worktreeName: name || path.basename(checkout),
+    workerUser: WORKER_ISOLATION.workerUser,
+    isolationActive: true,
+  });
+}
+
+/**
  * Supervised start for bridge/Hyperagent (CLI outside agent terminal).
  *
  * `orchestration worker-start` returns selector_not_found from bare shell cwd
@@ -1782,6 +1812,25 @@ async function dispatchWorker(args = {}) {
   if (isolationPlan.mode === 'isolated-command') {
     workerLaunchCommand = isolationPlan.launchCommand;
     if (worktree === 'current') {
+      // Re-grant on an existing checkout (parent default ACL is no longer trusted).
+      worktreePath = resolveRepoFilesystemPath(repo) || (repo.startsWith('/') ? repo : null);
+      const hardened = await hardenWorktreeIfIsolated({
+        checkoutPath: worktreePath,
+        repo,
+        name: name || (worktreePath ? path.basename(worktreePath) : ''),
+      });
+      steps.push({ step: 'worktree-harden', ...hardened });
+      if (!hardened.ok) {
+        return {
+          ok: false,
+          stage: 'worktree-harden',
+          run_id: runId,
+          task_id: taskId,
+          error: hardened.error || 'per-worktree ACL / gitdir-pointer harden failed',
+          worktree: worktreePath,
+          steps,
+        };
+      }
       const termArgv = isolationPlan.terminalArgv;
       const termRes = await runJson(termArgv, { timeoutMs: WORKER_START_TIMEOUT_MS });
       steps.push({ step: 'terminal-create-isolated', launchCommand: workerLaunchCommand, ...termRes });
@@ -1829,6 +1878,23 @@ async function dispatchWorker(args = {}) {
       const wr = wtRes.envelope?.result || {};
       worktreePath = pick(wr, 'path') || pick(wr.worktree, 'path') || null;
       worktreeId = pick(wr, 'id') || null;
+      const hardened = await hardenWorktreeIfIsolated({
+        checkoutPath: worktreePath,
+        repo,
+        name: name || (worktreePath ? path.basename(String(worktreePath)) : ''),
+      });
+      steps.push({ step: 'worktree-harden', ...hardened });
+      if (!hardened.ok) {
+        return {
+          ok: false,
+          stage: 'worktree-harden',
+          run_id: runId,
+          task_id: taskId,
+          error: hardened.error || 'per-worktree ACL / gitdir-pointer harden failed',
+          worktree: worktreePath,
+          steps,
+        };
+      }
       const wtSel = worktreePath
         ? (String(worktreePath).startsWith('path:') ? String(worktreePath) : `path:${worktreePath}`)
         : (worktreeId ? String(worktreeId) : null);
@@ -2522,7 +2588,7 @@ async function releaseWorker(args = {}) {
     senderCaches,
     coordinatorHandles,
   };
-  return executeReleaseWorker(args, {
+  const released = await executeReleaseWorker(args, {
     clientKey: currentClientKey(),
     ownershipDeps,
     runJson,
@@ -2557,6 +2623,30 @@ async function releaseWorker(args = {}) {
       return out;
     },
   });
+  if (
+    released &&
+    released.ok &&
+    WORKER_ISOLATION.enabled &&
+    !WORKER_ISOLATION.sameUid
+  ) {
+    const did = released.dispatch_id || args.dispatch_id || '';
+    const row = did ? dispatchRegistry.get(String(did)) : null;
+    const wt = row && row.worktree ? String(row.worktree) : '';
+    if (wt) {
+      try {
+        released.worktree_acl_revoked = await revokeWorktreeWorkerAcl({
+          checkoutPath: wt,
+          workerUser: WORKER_ISOLATION.workerUser,
+        });
+      } catch (e) {
+        released.worktree_acl_revoked = {
+          ok: false,
+          error: String(e && e.message ? e.message : e),
+        };
+      }
+    }
+  }
+  return released;
 }
 
 

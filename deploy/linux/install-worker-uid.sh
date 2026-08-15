@@ -132,12 +132,16 @@ else
   visudo -cf "${SEED_SUDOERS_DST}"
 fi
 
-# 4) worktree / repo access without shared group:
-#    ACL on worktree roots (operator chooses paths). Example only — not applied:
-echo "install-worker-uid: grant repo/worktree access with ACLs (example, not auto-applied):"
-echo "  setfacl -R -m u:${WORKER_USER}:rwx /home/${BRIDGE_USER}/orca/workspaces"
-echo "  setfacl -R -d -m u:${WORKER_USER}:rwx /home/${BRIDGE_USER}/orca/workspaces"
-echo "  # Prefer per-tree ACLs over a shared unix group."
+# 4) worktree / repo access without shared group (NAS-259 variant 2).
+#    Do NOT grant a recursive/default ACL on the workspaces root — that lets
+#    uid 994 write every sibling tree and inherit rwx on the checkout .git
+#    pointer (NAS-266). The bridge grants u:${WORKER_USER}:rwx on the specific
+#    worktree at create time and strips the named ACL from .git.
+echo "install-worker-uid: per-worktree ACL is applied by the bridge at worktree-create."
+echo "install-worker-uid: if a tree-wide default ACL is already present, strip it as ${BRIDGE_USER}:"
+echo "  setfacl -R -x u:${WORKER_USER} /home/${BRIDGE_USER}/orca/workspaces"
+echo "  setfacl -R -k /home/${BRIDGE_USER}/orca/workspaces"
+echo "  # then re-grant only live in-flight checkouts (see docs/runbooks/nas-255-worker-uid.md)"
 
 # 5) env fragment for the unit (does not write secrets)
 ENV_HINT="/etc/orca-mcp/worker-isolation.env"

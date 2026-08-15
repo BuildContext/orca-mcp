@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **NAS-266 / NAS-259 variant 2:** Isolated `worktree create` now grants the
+  worker named+default ACL on **that checkout only**, then strips the named
+  ACL from the `.git` gitdir pointer and `chmod 0644`s it. 997 git in a
+  worker checkout must pass `assertWorktreeGitdirPointer` (greppable
+  `GITDIR_POINTER_REFUSED` if `.git` is a directory, a symlink, or not
+  `<repo>/.git/worktrees/<name>`). The bridge composes `git add -- <paths>`
+  only — never `-A`. Installer/runbook no longer recommend a recursive
+  default ACL on `/home/orca/orca/workspaces`. Pre-existing trees are **not**
+  rewritten; the operator (uid 997) must strip the leftover parent default
+  (see `docs/runbooks/nas-255-worker-uid.md`). Per-dispatch uid is still
+  not shipped. Version is not bumped here.
+
 ## 0.3.5 — 2026-08-15
 
 ### Fixed

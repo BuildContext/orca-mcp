@@ -55,6 +55,7 @@
     "lib/worker-isolation.mjs",
     "lib/worker-cap-file.mjs",
     "lib/worker-orch-relay.mjs",
+    "lib/worktree-harden.mjs",
     "lib/release-worker.mjs",
     "lib/cli-argv-normalize.mjs",
     "scripts/",
