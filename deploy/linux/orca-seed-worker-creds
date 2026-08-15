@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# NAS-258 — privileged install of worker credential + capability files.
+#
+# Invoked ONLY as:
+#   sudo -n /usr/local/lib/orca-mcp/orca-seed-worker-creds seed
+#   sudo -n /usr/local/lib/orca-mcp/orca-seed-worker-creds purge
+#
+# `seed` is deliberately overloaded (sudoers is an exact two-verb allowlist
+# and MUST NOT be extended for env_keep or new verbs):
+#   1. process /run/orca-mcp/cap-stage/*.purge  → unlink that dispatch's cap
+#   2. install  /run/orca-mcp/cap-stage/*.json  → 994:994 0600 cap files
+#   3. copy     /home/orca/.grok/auth.json      → worker HOME (existing)
+set -euo pipefail
+umask 077
+
+BRIDGE_USER=orca
+WORKER_USER=orca-worker
+BRIDGE_HOME=/home/orca
+WORKER_HOME=/home/orca-worker
+BRIDGE_UID=997
+WORKER_UID=994
+WORKER_GID=994
+SRC_AUTH=/home/orca/.grok/auth.json
+DEST_DIR=/home/orca-worker/.grok
+DEST_AUTH="${DEST_DIR}/auth.json"
+
+CAP_ROOT=/run/orca-mcp
+CAPS="${CAP_ROOT}/worker-caps"
+STAGE="${CAP_ROOT}/cap-stage"
+HOME_CAP_DIR="${WORKER_HOME}/.orca-worker"
+
+usage() { echo "usage: orca-seed-worker-creds seed|purge" >&2; exit 64; }
+
+safe_id() {
+  [[ "$1" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]
+}
+
+ensure_dirs() {
+  install -d -m 0755 -o root -g root "${CAP_ROOT}"
+  install -d -m 0711 -o root -g root "${CAPS}"
+  install -d -m 0711 -o root -g root "${CAPS}/by-task"
+  install -d -m 0700 -o "${BRIDGE_UID}" -g "${BRIDGE_UID}" "${STAGE}"
+  install -d -m 0700 -o "${WORKER_UID}" -g "${WORKER_GID}" "${HOME_CAP_DIR}"
+}
+
+assert_stage_file() {
+  local src="$1"
+  [[ -f "${src}" && ! -L "${src}" ]] || return 1
+  [[ "$(stat -c '%u' "${src}")" == "${BRIDGE_UID}" ]] || return 1
+  [[ "$(stat -c '%a' "${src}")" == "600" ]] || return 1
+  [[ "$(stat -c '%s' "${src}")" -gt 0 ]] || return 1
+}
+
+install_one_cap() {
+  local src="$1"
+  assert_stage_file "${src}" || { echo "seed: reject staged cap ${src}" >&2; return 1; }
+  local parsed
+  parsed="$(python3 - "${src}" <<'PY'
+import json, re, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    obj = json.load(f)
+if not isinstance(obj, dict) or obj.get("v") != 1:
+    raise SystemExit("bad version")
+did = obj.get("dispatchId") or ""
+tid = obj.get("taskId") or ""
+cap = obj.get("capability") or ""
+ident = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+if not ident.fullmatch(did) or not ident.fullmatch(tid):
+    raise SystemExit("bad id")
+if not isinstance(cap, str) or len(cap) < 8:
+    raise SystemExit("bad capability")
+print(did)
+print(tid)
+PY
+)" || { echo "seed: staged cap JSON invalid: ${src}" >&2; return 1; }
+  local did tid
+  did="$(printf '%s\n' "${parsed}" | sed -n '1p')"
+  tid="$(printf '%s\n' "${parsed}" | sed -n '2p')"
+  safe_id "${did}" && safe_id "${tid}" || { echo "seed: unsafe id in ${src}" >&2; return 1; }
+
+  local dest="${CAPS}/${did}.json"
+  local tmp="${CAPS}/.${did}.seed.$$"
+  (set -o noclobber; : > "${tmp}") 2>/dev/null || { echo "seed: cap tmp exists" >&2; return 1; }
+  cat -- "${src}" > "${tmp}"
+  chown "${WORKER_UID}:${WORKER_GID}" "${tmp}"
+  chmod 0600 "${tmp}"
+  mv -f -- "${tmp}" "${dest}"
+
+  local ptr="${CAPS}/by-task/${tid}"
+  local ptrtmp="${CAPS}/by-task/.${tid}.seed.$$"
+  (set -o noclobber; : > "${ptrtmp}") 2>/dev/null || { echo "seed: by-task tmp exists" >&2; return 1; }
+  printf '%s\n' "${did}" > "${ptrtmp}"
+  chown "${WORKER_UID}:${WORKER_GID}" "${ptrtmp}"
+  chmod 0600 "${ptrtmp}"
+  mv -f -- "${ptrtmp}" "${ptr}"
+
+  local curtmp="${HOME_CAP_DIR}/.current-cap.seed.$$"
+  (set -o noclobber; : > "${curtmp}") 2>/dev/null || { echo "seed: current-cap tmp exists" >&2; return 1; }
+  cat -- "${dest}" > "${curtmp}"
+  chown "${WORKER_UID}:${WORKER_GID}" "${curtmp}"
+  chmod 0600 "${curtmp}"
+  mv -f -- "${curtmp}" "${HOME_CAP_DIR}/current-cap.json"
+
+  echo "seed: cap ${dest}"
+}
+
+remove_one_cap() {
+  local did="$1"
+  safe_id "${did}" || return 1
+  rm -f -- "${CAPS}/${did}.json"
+  local ptr
+  shopt -s nullglob
+  for ptr in "${CAPS}/by-task"/*; do
+    [[ -f "${ptr}" && ! -L "${ptr}" ]] || continue
+    if [[ "$(tr -d '[:space:]' < "${ptr}")" == "${did}" ]]; then
+      rm -f -- "${ptr}"
+    fi
+  done
+  if [[ -f "${HOME_CAP_DIR}/current-cap.json" ]]; then
+    if python3 - "${HOME_CAP_DIR}/current-cap.json" "${did}" <<'PY'
+import json, sys
+try:
+    obj = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+raise SystemExit(0 if obj.get("dispatchId") == sys.argv[2] else 1)
+PY
+    then
+      rm -f -- "${HOME_CAP_DIR}/current-cap.json"
+    fi
+  fi
+  echo "seed: purged cap ${did}"
+}
+
+process_purge_markers() {
+  ensure_dirs
+  shopt -s nullglob
+  local marker
+  for marker in "${STAGE}"/*.purge; do
+    [[ -f "${marker}" && ! -L "${marker}" ]] || continue
+    local did
+    did="$(tr -d '[:space:]' < "${marker}")"
+    if safe_id "${did}"; then
+      remove_one_cap "${did}" || true
+    fi
+    rm -f -- "${marker}"
+  done
+}
+
+install_staged_caps() {
+  ensure_dirs
+  shopt -s nullglob
+  local src
+  for src in "${STAGE}"/*.json; do
+    [[ -e "${src}" ]] || continue
+    install_one_cap "${src}" || continue
+    rm -f -- "${src}"
+  done
+}
+
+assert_source() {
+  [[ -f "${SRC_AUTH}" && ! -L "${SRC_AUTH}" ]] || { echo "seed: source missing or not regular: ${SRC_AUTH}" >&2; exit 66; }
+  [[ "$(stat -c '%u' "${SRC_AUTH}")" == "${BRIDGE_USER:+997}" ]] || { echo "seed: source uid is not 997" >&2; exit 66; }
+  [[ "$(stat -c '%a' "${SRC_AUTH}")" == "600" ]] || { echo "seed: source mode is not 0600" >&2; exit 66; }
+  [[ "$(stat -c '%s' "${SRC_AUTH}")" -gt 0 ]] || { echo "seed: source empty" >&2; exit 66; }
+}
+
+seed_auth() {
+  assert_source
+  if [[ -e "${DEST_DIR}" && -L "${DEST_DIR}" ]]; then
+    echo "seed: destination directory is symlink" >&2
+    exit 70
+  fi
+  install -d -m 0700 -o "${WORKER_UID}" -g "${WORKER_GID}" "${DEST_DIR}"
+  [[ ! -L "${DEST_DIR}" ]] || { echo "seed: destination directory is symlink" >&2; exit 70; }
+  local tmp
+  tmp="${DEST_DIR}/.auth.json.seed.$$"
+  (set -o noclobber; : > "${tmp}") 2>/dev/null || { echo "seed: temporary destination exists" >&2; exit 70; }
+  trap 'rm -f -- "${tmp}"' EXIT
+  cat -- "${SRC_AUTH}" > "${tmp}"
+  chown "${WORKER_UID}:${WORKER_GID}" "${tmp}"
+  chmod 0600 "${tmp}"
+  mv -f -- "${tmp}" "${DEST_AUTH}"
+  trap - EXIT
+  echo "seed: wrote ${DEST_AUTH}"
+}
+
+seed() {
+  process_purge_markers
+  install_staged_caps
+  seed_auth
+}
+
+purge_all_caps() {
+  ensure_dirs
+  find "${CAPS}" -mindepth 1 -maxdepth 2 \( -type f -o -type l \) -delete 2>/dev/null || true
+  rm -f -- "${HOME_CAP_DIR}/current-cap.json"
+  find "${STAGE}" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -delete 2>/dev/null || true
+  echo "purge: worker-caps"
+}
+
+purge() {
+  [[ ! -L "${DEST_DIR}" ]] || { echo "purge: destination directory is symlink" >&2; exit 70; }
+  process_purge_markers
+  purge_all_caps
+  rm -f -- "${DEST_AUTH}"
+  echo "purge: ${DEST_AUTH}"
+}
+
+[[ "$(id -u)" -eq 0 ]] || { echo "seed: must run as root" >&2; exit 77; }
+[[ $# -eq 1 ]] || usage
+case "$1" in
+  seed) seed ;;
+  purge) purge ;;
+  *) usage ;;
+esac

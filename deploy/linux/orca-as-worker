@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# NAS-258 — worker-facing `orca` on PATH.
+#
+# Installed root:root 0755 at /usr/local/bin/orca so uid 994 (whose PATH is
+# the sudo secure_path, no ~/.local/bin) can run `orca orchestration send`
+# and actually deliver worker_done.
+#
+# When a capability file is readable this execs the orch helper (HMAC →
+# bridge HTTP relay). Otherwise it falls through to the host AppImage CLI
+# so a mistaken 997 invocation of /usr/local/bin/orca still works.
+set -euo pipefail
+
+find_cap_file() {
+  if [[ -n "${ORCA_WORKER_CAP_FILE:-}" && -r "${ORCA_WORKER_CAP_FILE}" ]]; then
+    printf '%s\n' "${ORCA_WORKER_CAP_FILE}"
+    return 0
+  fi
+  local home="${HOME:-}"
+  if [[ -n "${home}" && -r "${home}/.orca-worker/current-cap.json" ]]; then
+    printf '%s\n' "${home}/.orca-worker/current-cap.json"
+    return 0
+  fi
+  local prev="" a
+  for a in "$@"; do
+    if [[ "${prev}" == "--dispatch-id" && -n "${a}" && "${a}" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]; then
+      local f="/run/orca-mcp/worker-caps/${a}.json"
+      if [[ -r "${f}" ]]; then
+        printf '%s\n' "${f}"
+        return 0
+      fi
+    fi
+    prev="${a}"
+  done
+  return 1
+}
+
+HELPER="${ORCA_WORKER_ORCH_HELPER:-/usr/local/lib/orca-mcp/orca-worker-orch.sh}"
+CAP=""
+if CAP="$(find_cap_file "$@")"; then
+  export ORCA_WORKER_CAP_FILE="${CAP}"
+  if [[ ! -x "${HELPER}" ]]; then
+    echo "orca: worker orch helper missing: ${HELPER}" >&2
+    exit 127
+  fi
+  exec "${HELPER}" "$@"
+fi
+
+# Host fallback — never used by uid 994 (no runtime metadata).
+HOST_ORCA="${ORCA_REAL_CLI:-}"
+if [[ -z "${HOST_ORCA}" ]]; then
+  if [[ -x /home/orca/.local/bin/orca ]]; then
+    HOST_ORCA=/home/orca/.local/bin/orca
+  elif [[ -x /usr/bin/orca-ide ]]; then
+    HOST_ORCA=/usr/bin/orca-ide
+  fi
+fi
+if [[ -n "${HOST_ORCA}" && -x "${HOST_ORCA}" && "${HOST_ORCA}" != "$0" ]]; then
+  exec "${HOST_ORCA}" "$@"
+fi
+
+echo "orca: no worker capability file and no host CLI" >&2
+exit 127

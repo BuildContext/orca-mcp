@@ -133,8 +133,23 @@ import {
   planIsolatedAgentPlacement,
   buildIsolatedTerminalCreateArgv,
   mintWorkerCapability,
+  verifyWorkerCapability,
+  workerCapabilityEnv,
   workerIsolationHealth,
 } from './lib/worker-isolation.mjs';
+import {
+  capStagePath,
+  capPurgeMarkerPath,
+  capFilePath,
+  serializeWorkerCapFile,
+  SEED_HELPER,
+  DEFAULT_BRIDGE_ORIGIN,
+} from './lib/worker-cap-file.mjs';
+import {
+  parseWorkerOrchArgv,
+  authorizeWorkerOrch,
+  getArgFlag,
+} from './lib/worker-orch-relay.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -1485,7 +1500,7 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent, wor
 
   // Still idle — send recovery prompt (spec + ids + worker_done contract)
   const capLine = workerCapability
-    ? `ORCA_WORKER_CAPABILITY is set for this dispatch (NAS-255 worker uid).\n`
+    ? `Worker capability file is at /run/orca-mcp/worker-caps/<dispatchId>.json (uid 994, 0600). Use orca orchestration send as documented.\n`
     : '';
   const recovery =
     `${spec}\n\n` +
@@ -1496,7 +1511,7 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent, wor
     `agent: ${agent}\n` +
     capLine +
     `When finished, send exactly one:\n` +
-    `orca orchestration send --type worker_done --subject "done" --body "<3 sentences>" ` +
+    `orca orchestration send --from ${handle} --type worker_done --subject "done" --body "<3 sentences>" ` +
     `--task-id ${taskId}` +
     (dispatchId ? ` --dispatch-id ${dispatchId}` : '') +
     ` --outcome succeeded --json\n` +
@@ -1536,6 +1551,83 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent, wor
     landed: looksWorking(snap) || envOk(sendRes),
     probes,
   };
+}
+
+function workerBridgeOrigin() {
+  const port = Number(process.env.ORCA_BRIDGE_PORT || process.env.PORT || 8787);
+  if (Number.isInteger(port) && port > 0 && port < 65536) {
+    return `http://127.0.0.1:${port}`;
+  }
+  return DEFAULT_BRIDGE_ORIGIN;
+}
+
+async function sudoSeedWorkerCreds() {
+  await execFile('sudo', ['-n', SEED_HELPER, 'seed']);
+}
+
+async function writeAtomic0600(dest, body) {
+  await fs.promises.mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
+  const tmp = `${dest}.tmp.${process.pid}`;
+  await fs.promises.writeFile(tmp, body, { mode: 0o600, flag: 'w' });
+  await fs.promises.chmod(tmp, 0o600);
+  await fs.promises.rename(tmp, dest);
+}
+
+/**
+ * Mint HMAC capability, write a 997-owned staging file, then invoke the
+ * existing `seed` sudoers verb so root materializes 994:994 0600 files.
+ * workerCapabilityEnv() is the field map — this is what makes that helper live.
+ */
+async function mintAndInstallWorkerCap({ dispatchId, taskId, handle }) {
+  const capability = mintWorkerCapability({
+    dispatchId,
+    taskId,
+    terminalHandle: handle,
+    clientKey: currentClientKey(),
+  }, WORKER_ISOLATION.hmacSecret);
+  const envBlock = workerCapabilityEnv({
+    capability,
+    bridgeOrigin: workerBridgeOrigin(),
+  });
+  const body = serializeWorkerCapFile({
+    capability: envBlock.ORCA_WORKER_CAPABILITY,
+    dispatchId,
+    taskId,
+    bridgeOrigin: envBlock.ORCA_WORKER_BRIDGE_ORIGIN,
+    orchHelper: envBlock.ORCA_WORKER_ORCH_HELPER,
+    terminalHandle: handle,
+  });
+  const staging = capStagePath(dispatchId);
+  try {
+    await writeAtomic0600(staging, body);
+  } catch (e) {
+    // Staging dir is created by seed (root). First call may need dirs first.
+    await sudoSeedWorkerCreds();
+    await writeAtomic0600(staging, body);
+  }
+  await sudoSeedWorkerCreds();
+  return {
+    capability,
+    path: capFilePath(dispatchId),
+    meta: {
+      path: capFilePath(dispatchId),
+      staged: staging,
+      origin: envBlock.ORCA_WORKER_BRIDGE_ORIGIN,
+      helper: envBlock.ORCA_WORKER_ORCH_HELPER,
+    },
+  };
+}
+
+async function markWorkerCapPurge(dispatchId) {
+  if (!dispatchId) return;
+  const marker = capPurgeMarkerPath(dispatchId);
+  try {
+    await writeAtomic0600(marker, `${dispatchId}\n`);
+  } catch {
+    await sudoSeedWorkerCreds();
+    await writeAtomic0600(marker, `${dispatchId}\n`);
+  }
+  await sudoSeedWorkerCreds();
 }
 
 /**
@@ -1674,6 +1766,7 @@ async function dispatchWorker(args = {}) {
       repo: repo || '',
       setup,
       baseBranch,
+      taskId,
     },
     WORKER_ISOLATION,
   );
@@ -1863,48 +1956,88 @@ async function dispatchWorker(args = {}) {
     };
   }
 
-  // 4) Wait until TUI can accept inject (readiness, not completion)
-  const waitRes = await runJson(
-    ['terminal', 'wait', '--terminal', handle, '--for', 'tui-idle', '--timeout-ms', '60000', '--json'],
-    { timeoutMs: 90_000 },
-  );
-  steps.push({ step: 'tui-idle', ...waitRes });
-  // Non-fatal if wait times out — still try inject
+  const isolated = isolationPlan.mode === 'isolated-command';
 
-  // 5) Inject supervised preamble + task (worker_done authority)
-  const dispRes = await runJson(
-    ['orchestration', 'dispatch', '--task', taskId, '--to', handle, '--inject', '--json'],
-    { timeoutMs: 60_000 },
-  );
-  steps.push({ step: 'dispatch-inject', ...dispRes });
+  // Isolated: bind dispatch BEFORE grok starts so we have a real dispatchId
+  // to name /run/orca-mcp/worker-caps/<dispatchId>.json. The wrapper is
+  // blocked on the by-task pointer until mintAndInstallWorkerCap returns.
+  // Legacy: wait for TUI, then dispatch --inject as before.
+  let waitRes = null;
+  let dispRes;
+  if (isolated) {
+    dispRes = await runJson(
+      ['orchestration', 'dispatch', '--task', taskId, '--to', handle, '--return-preamble', '--json'],
+      { timeoutMs: 60_000 },
+    );
+    steps.push({ step: 'dispatch-bind', isolated: true, ...dispRes });
+  } else {
+    waitRes = await runJson(
+      ['terminal', 'wait', '--terminal', handle, '--for', 'tui-idle', '--timeout-ms', '60000', '--json'],
+      { timeoutMs: 90_000 },
+    );
+    steps.push({ step: 'tui-idle', ...waitRes });
+    dispRes = await runJson(
+      ['orchestration', 'dispatch', '--task', taskId, '--to', handle, '--inject', '--json'],
+      { timeoutMs: 60_000 },
+    );
+    steps.push({ step: 'dispatch-inject', ...dispRes });
+  }
   if (!envOk(dispRes)) {
     return {
       ok: false,
-      stage: 'dispatch-inject',
+      stage: isolated ? 'dispatch-bind' : 'dispatch-inject',
       run_id: runId,
       task_id: taskId,
       terminal_handle: handle,
       worktree: worktreePath,
-      error: 'dispatch --inject failed',
+      error: isolated ? 'dispatch (pre-inject bind) failed' : 'dispatch --inject failed',
       steps,
     };
   }
 
   const dr = dispRes.envelope?.result || {};
   const dispatchId = pick(dr.dispatch, 'id') || pick(dr, 'dispatchId', 'dispatch_id');
+  const dispatchPreamble = pick(dr, 'preamble') || '';
 
-  // 6) Mint worker capability (NAS-255) then inject liveness recovery.
+  // 6) Mint worker capability to a 994:994 0600 file (NAS-258).
+  // workerCapabilityEnv() is invoked inside mintAndInstallWorkerCap.
   let workerCapability = null;
+  let workerCapFile = null;
   if (WORKER_ISOLATION.enabled && WORKER_ISOLATION.hmacSecret && dispatchId && taskId) {
     try {
-      workerCapability = mintWorkerCapability({
-        dispatchId,
-        taskId,
-        terminalHandle: handle,
-        clientKey: currentClientKey(),
-      }, WORKER_ISOLATION.hmacSecret);
+      const installed = await mintAndInstallWorkerCap({ dispatchId, taskId, handle });
+      workerCapability = installed.capability;
+      workerCapFile = installed.path;
+      steps.push({ step: 'worker-capability-file', ...installed.meta });
     } catch (e) {
-      steps.push({ step: 'worker-capability', error: String(e?.message || e) });
+      steps.push({ step: 'worker-capability-file', error: String(e?.message || e) });
+    }
+  }
+
+  if (isolated) {
+    waitRes = await runJson(
+      ['terminal', 'wait', '--terminal', handle, '--for', 'tui-idle', '--timeout-ms', '60000', '--json'],
+      { timeoutMs: 90_000 },
+    );
+    steps.push({ step: 'tui-idle', ...waitRes });
+    // Runtime preamble carries --from + --dispatch-capability (dcap_).
+    // Isolated bind skipped --inject so the waiting wrapper never saw it;
+    // deliver it now that grok is up.
+    if (dispatchPreamble) {
+      const preSend = await runJson(
+        ['terminal', 'send', '--terminal', handle, '--text', dispatchPreamble, '--enter', '--json'],
+        { timeoutMs: 30_000 },
+      );
+      await sleep(800);
+      await runJson(
+        ['terminal', 'send', '--terminal', handle, '--text', '', '--enter', '--json'],
+        { timeoutMs: 15_000 },
+      );
+      steps.push({
+        step: 'dispatch-preamble-send',
+        ok: envOk(preSend),
+        preamble_len: dispatchPreamble.length,
+      });
     }
   }
 
@@ -1953,6 +2086,7 @@ async function dispatchWorker(args = {}) {
     agent,
     worktree: worktreePath || null,
     name: name || null,
+    extra: { workerIsolation: isolationPlan.mode === 'isolated-command' },
   });
 
 
@@ -1976,8 +2110,9 @@ async function dispatchWorker(args = {}) {
     worker_isolation: workerIsolationHealth(WORKER_ISOLATION),
     worker_launch_command: workerLaunchCommand,
     worker_capability_minted: Boolean(workerCapability),
-    // Capability is for the worker process env (wrapper); not echoed in full to coordinators.
+    // Capability is a 994:994 0600 file; never echoed in full to coordinators.
     worker_capability_len: workerCapability ? workerCapability.length : 0,
+    worker_capability_file: workerCapFile,
     next: {
       action: 'await',
       detail:
@@ -2373,6 +2508,31 @@ async function releaseWorker(args = {}) {
     releaseRefusesCoordinator,
     coordinatorHandles,
     upsertDispatch: (id, row) => dispatchRegistry.upsert(id, row),
+    purgeWorkerCreds: async (opts = {}) => {
+      const did = opts.dispatchId != null ? String(opts.dispatchId).trim() : '';
+      const out = { ok: true, cap: null, creds: null };
+      if (did) {
+        try {
+          await markWorkerCapPurge(did);
+          out.cap = { ok: true, dispatchId: did };
+        } catch (e) {
+          out.ok = false;
+          out.cap = { ok: false, error: String(e?.message || e) };
+        }
+      }
+      if (opts.creds === false) {
+        out.creds = { skipped: 'other_live_isolated_dispatch' };
+        return out;
+      }
+      try {
+        await execFile('sudo', ['-n', SEED_HELPER, 'purge']);
+        out.creds = { ok: true };
+      } catch (e) {
+        out.ok = false;
+        out.creds = { ok: false, error: String(e?.message || e) };
+      }
+      return out;
+    },
   });
 }
 
@@ -3277,6 +3437,74 @@ button{margin-top:14px;padding:10px 18px;font-size:15px;cursor:pointer}small{col
   return false; // not an OAuth path
 }
 
+/**
+ * Unauthenticated (HMAC capability) worker orch relay.
+ * Lives before the bearer gate so uid 994 never needs ORCA_BRIDGE_TOKEN.
+ */
+async function handleWorkerOrchHttp(req, res) {
+  if (req.method !== 'POST') {
+    return sendJson(res, 405, { ok: false, error: 'method not allowed' }, { allow: 'POST' });
+  }
+  if (!WORKER_ISOLATION.hmacSecret) {
+    return sendJson(res, 503, { ok: false, error: 'worker hmac not configured' });
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 256 * 1024));
+  } catch (e) {
+    return sendJson(res, 400, { ok: false, error: 'invalid json: ' + (e?.message || e) });
+  }
+  const token = typeof body?.capability === 'string' ? body.capability : '';
+  const argv = Array.isArray(body?.argv) ? body.argv.map(String) : [];
+  const verified = verifyWorkerCapability(token, WORKER_ISOLATION.hmacSecret, {});
+  if (!verified.ok) {
+    log(`worker-orch deny code=${verified.code}`);
+    return sendJson(res, 401, { ok: false, error: verified.code, message: verified.message });
+  }
+  const parsed = parseWorkerOrchArgv(argv);
+  const authz = authorizeWorkerOrch({ parsed, payload: verified.payload });
+  if (!authz.ok) {
+    log(`worker-orch deny code=${authz.code}`);
+    return sendJson(res, 403, { ok: false, error: authz.code, message: authz.message });
+  }
+
+  const relayArgv = [...parsed.relayArgv];
+  if (!relayArgv.includes('--json')) relayArgv.push('--json');
+  const expectedDispatch = verified.payload.dispatchId;
+  const expectedTask = verified.payload.taskId;
+  if (expectedDispatch && !relayArgv.includes('--dispatch-id')) {
+    relayArgv.push('--dispatch-id', String(expectedDispatch));
+  }
+  if (expectedTask && !relayArgv.includes('--task-id')) {
+    relayArgv.push('--task-id', String(expectedTask));
+  }
+  // Do NOT inject the coordinator pin. Worker lifecycle signals must come
+  // from the dispatched pane; --from is the worker terminal handle.
+  const fromHandle = getArgFlag(relayArgv, '--from') || verified.payload.terminalHandle;
+  if (fromHandle && !relayArgv.includes('--from')) {
+    relayArgv.push('--from', String(fromHandle));
+  }
+
+  const timeoutMs = parsed.verb === 'ask' ? 620_000 : 60_000;
+  log(`worker-orch relay op=${authz.op} dispatch=${expectedDispatch || '-'} verb=${parsed.verb}`);
+  const described = await runJson(relayArgv, { timeoutMs, injectSender: false });
+  const lifecycle = described?.envelope?.result?.lifecycle;
+  const rejected = lifecycle && lifecycle.action === 'rejected';
+  const ok = !rejected && (envOk(described) || described?.ok === true);
+  return sendJson(res, ok ? 200 : 502, {
+    ok,
+    exitCode: ok ? 0 : 1,
+    stdout: described?.stdout || '',
+    result: described?.envelope?.result ?? described?.envelope ?? null,
+    error: ok
+      ? undefined
+      : (lifecycle?.reason
+        || described?.envelope?.error
+        || described?.error
+        || 'relay failed'),
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const origin = originFor(req);
   const preAuthPath = (req.url || '/').split('?')[0];
@@ -3286,6 +3514,11 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, corsHeaders());
     return res.end();
+  }
+
+  // NAS-258: HMAC-gated worker orch relay — before bearer token gate.
+  if (preAuthPath === '/worker/orch') {
+    return handleWorkerOrchHttp(req, res);
   }
 
   // OAuth endpoints and discovery are handled BEFORE the token gate.
