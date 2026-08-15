@@ -94,8 +94,18 @@ Supervised dispatch path:
 ```text
 run-create → task-create → worktree/agent terminal →
   terminal wait tui-idle → orchestration dispatch --inject →
-  liveness probe → (optional) terminal send recovery
+  terminal send --enter (submit the typed compose) →
+  liveness probe → (optional) terminal send --text … --enter recovery
 ```
+
+`orchestration dispatch --inject` **types** the brief into the TUI compose box
+and has **no Enter affordance**. There is no `--submit` flag on any Orca
+command. After `--inject` the bridge sends `terminal send --enter` to submit
+the already-typed compose. When the bridge itself types text (idle recovery,
+isolated preamble), submit is **target-dependent**: a shell target submits on
+the first `--text … --enter`; a Grok TUI compose box needs that plus a
+following empty `--enter` (verified live 2026-08-15). The extra send is
+harmless when the first already submitted.
 
 Some agents (notably Grok) accept `--inject` and still sit at **Turns:0 /
 idle**. The dispatch envelope looks fine; the worker never starts work. Without
@@ -103,14 +113,19 @@ recovery the coordinator waits forever on `await`.
 
 ### What the bridge does
 
-After `--inject`, `ensureInjectLanded`:
+After `--inject`, the bridge sends `terminal send --enter` to submit the
+already-typed compose. Then `ensureInjectLanded`:
 
 1. Snapshots terminal preview/tail and decides "looks working" vs idle.
-2. If idle, pushes the task text again via `terminal send` + Enter, with an
-   explicit **inject-recovery** trailer that restates `task_id`, `dispatch_id`,
-   and the `worker_done` contract.
+2. If idle, pushes the task text again via `terminal send --text … --enter`
+   **plus** a following empty `--enter` (TUI draft buffer; shell already
+   submitted on the first), with an explicit **inject-recovery** trailer that
+   restates `task_id`, `dispatch_id`, and the `worker_done` contract. Use
+   `--interrupt` on a stuck TUI.
 3. Re-probes. Results surface on the dispatch response as
    `inject_recovered` / `inject_landed` so coordinators can see the fix fired.
+   `injected` is whatever the runtime `--inject` envelope reported — the
+   runtime cannot express Enter, so do not treat `injected:true` as "submitted".
 
 Disable with `ORCA_BRIDGE_INJECT_RECOVERY=0`. Settle window:
 `ORCA_BRIDGE_INJECT_SETTLE_MS` (default 10s).

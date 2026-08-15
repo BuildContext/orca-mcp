@@ -61,6 +61,7 @@ import {
   tokenMatches as tokenMatchesCore,
   extractBearer,
   injectSenderArgv,
+  buildTerminalSendArgv,
   parseOrchestrationReplyArgv,
   resolveWorkerDispatchId,
   buildEscalationReplyFollowupSendArgv,
@@ -1486,6 +1487,8 @@ function looksWorking(snap) {
 /**
  * If inject did not land in TUI (common for grok: accepted but Turns:0 idle),
  * push the task text via terminal send + Enter, with worker_done recovery trailer.
+ * There is no `--submit` flag. A shell target submits on the first `--enter`;
+ * a Grok TUI draft buffer needs a following empty-text `--enter` (see below).
  */
 async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent, workerCapability = null }) {
   const settleMs = Number(process.env.ORCA_BRIDGE_INJECT_SETTLE_MS || 10_000);
@@ -1524,13 +1527,17 @@ async function ensureInjectLanded({ handle, taskId, dispatchId, spec, agent, wor
   );
 
   const sendRes = await runJson(
-    ['terminal', 'send', '--terminal', handle, '--text', recovery, '--enter', '--json'],
+    buildTerminalSendArgv({ handle, text: recovery, enter: true }),
     { timeoutMs: 30_000 },
   );
-  // Grok multiline: second Enter often needed to submit from draft buffer
+  // Shell target submits on the first --enter. A Grok TUI draft buffer
+  // needs the second empty-text --enter to leave compose (verified live
+  // 2026-08-15: --text <payload> --enter left the brief sitting in the
+  // box; only a subsequent bare CR submitted it). The second send is
+  // harmless when redundant (plain bash already submitted on the first).
   await sleep(800);
   const enterRes = await runJson(
-    ['terminal', 'send', '--terminal', handle, '--text', '', '--enter', '--json'],
+    buildTerminalSendArgv({ handle, text: '', enter: true }),
     { timeoutMs: 15_000 },
   );
 
@@ -1636,7 +1643,8 @@ async function markWorkerCapPurge(dispatchId) {
  * `orchestration worker-start` returns selector_not_found from bare shell cwd
  * (e.g. $HOME). Working path verified on this host:
  *   run-create → task-create → worktree create --agent → terminal wait tui-idle
- *   → orchestration dispatch --inject → liveness probe → terminal send recovery if idle
+ *   → orchestration dispatch --inject → terminal send --enter → liveness probe
+ *   → optional send --text … --enter + empty --enter recovery (TUI draft buffer)
  */
 async function dispatchWorker(args = {}) {
 
@@ -1981,6 +1989,16 @@ async function dispatchWorker(args = {}) {
       { timeoutMs: 60_000 },
     );
     steps.push({ step: 'dispatch-inject', ...dispRes });
+    // Runtime `--inject` types the brief into the compose box and has no
+    // Enter flag. Submit it with `terminal send --enter` (not `--submit`).
+    if (envOk(dispRes)) {
+      await sleep(800);
+      const injectEnter = await runJson(
+        buildTerminalSendArgv({ handle, enter: true }),
+        { timeoutMs: 15_000 },
+      );
+      steps.push({ step: 'dispatch-inject-enter', ok: envOk(injectEnter) });
+    }
   }
   if (!envOk(dispRes)) {
     return {
@@ -2025,17 +2043,21 @@ async function dispatchWorker(args = {}) {
     // deliver it now that grok is up.
     if (dispatchPreamble) {
       const preSend = await runJson(
-        ['terminal', 'send', '--terminal', handle, '--text', dispatchPreamble, '--enter', '--json'],
+        buildTerminalSendArgv({ handle, text: dispatchPreamble, enter: true }),
         { timeoutMs: 30_000 },
       );
+      // Same two-send rule as inject recovery: shell submits on the first
+      // --enter; a Grok TUI draft buffer needs the following empty --enter
+      // (verified live 2026-08-15). Harmless when the first already submitted.
       await sleep(800);
-      await runJson(
-        ['terminal', 'send', '--terminal', handle, '--text', '', '--enter', '--json'],
+      const preEnter = await runJson(
+        buildTerminalSendArgv({ handle, text: '', enter: true }),
         { timeoutMs: 15_000 },
       );
       steps.push({
         step: 'dispatch-preamble-send',
         ok: envOk(preSend),
+        enterOk: envOk(preEnter),
         preamble_len: dispatchPreamble.length,
       });
     }
@@ -2118,7 +2140,8 @@ async function dispatchWorker(args = {}) {
       detail:
         'Poll: orca { action:"await", runId, waitMs:45000 }. Empty/timeout = continue. ' +
         'worker_done -> orca { action:"release", dispatchId, terminalHandle }. ' +
-        'If inject_recovered=true, prompt was re-sent via terminal send (Grok idle fix).',
+        'If inject_recovered=true, prompt was re-sent via terminal send --text … --enter plus a following empty --enter (Grok TUI draft buffer). ' +
+        'Stuck TUI: terminal send --interrupt on the worker handle.',
       run_id: runId,
       dispatch_id: dispatchId || null,
       terminal_handle: handle,

@@ -1,5 +1,20 @@
 # NAS-257 / NAS-260 — 0.3.3 worker handoff
 
+> **CORRECTION (session 7 / 0.3.5):** The `--submit` premise was **disproven**.
+> `submit` appears zero times in Orca's CLI parser; there is no `--submit`
+> flag on any command. The real submit affordance is **`--enter`**
+> ("Append Enter after sending text") on `terminal send`, plus `--interrupt`.
+> `--enter` was already classified (`FLAG_TABLE` / `NON_TARGET_FLAGS`,
+> `BOOLEAN_FLAGS`, and the `terminal send` exact-form `allowedFlags`) and
+> needed no carve-out. The 0.3.3 `POLICY_SCOPED_BOOLEAN_FLAGS` hook that
+> whitelisted a phantom `--submit` was **reverted in 0.3.5**. Submit is
+> **target-dependent**: a shell takes one `--enter`; a TUI compose box
+> needs the text send plus a following empty `--enter`. Do not treat
+> the rest of this file as current doctrine — it records what was believed
+> when 0.3.3 shipped.
+
+
+
 Uncommitted in worktree `nas257-260-033-s6c`. Do not commit from uid 994 (NAS-262).
 
 ## Daemon chmod confirmation (NAS-257, required before the unit edit)
