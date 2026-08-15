@@ -41,12 +41,29 @@ Every finding in the NAS-248 line reduces to single-uid trust: the worker *is* t
 - **No shared unix group** between bridge and worker for secret paths. Repo/worktree access via **ACLs** on tree roots, not a shared group.
 - **Runtime token** (`~/.config/orca/orca-runtime.json`, daemon token) stays 0600 bridge-owned. Workers do not get it. Coordinator inject/release/terminal ops run inside the bridge (bridge uid) and keep working. Worker→mailbox signals use a bridge-minted **HMAC capability** (`ORCA_WORKER_CAPABILITY`); full capability→runtime relay is part of attended cutover.
 
-## Linux VM cutover (attended) — 0.3.2 full order
+## Linux VM cutover (attended) — 0.3.3 full order
 
 This is the **owner-attended** path from a live 0.3.0 host (unsigned pin /
-ownership stores) onto the merged 0.3.2 tree (signed stores + optional worker
+ownership stores) onto the merged 0.3.3 tree (signed stores + optional worker
 uid). Do **not** weaken runtime load: unsigned stays rejected until the
 migrator runs.
+
+**Install root must be outside `/home`.** The signer unit ships
+`WorkingDirectory=/opt/orca-mcp` and `ProtectHome=true`. Pointing the unit at a
+checkout under `/home/...` fails with `status=200/CHDIR`. Do not weaken
+`ProtectHome` to paper over that — install under `/opt/orca-mcp`.
+
+**After deploying 0.3.3:** remove the live NAS-257 workaround drop-in (if
+present) and reload:
+
+```bash
+sudo rm -f /etc/systemd/system/orca-bridge-store-signer.service.d/10-fix-startpost.conf
+sudo rmdir /etc/systemd/system/orca-bridge-store-signer.service.d 2>/dev/null || true
+sudo systemctl daemon-reload
+```
+
+The shipped unit no longer has `ExecStartPost=` (it raced `Type=simple` async
+`listen()`). The daemon `chmodSync(0o660)`s the socket itself.
 
 ### Order (do not reorder past the stop/migrate fence)
 
@@ -56,7 +73,7 @@ migrator runs.
 | 2 | **Stop** old bridge (`orca-bridge.service`) | **Yes — stay stopped through step 5** |
 | 3 | Migrator **dry-run** (bridge uid) | **Yes** |
 | 4 | Migrator **apply** (bridge uid) | **Yes** |
-| 5 | Install 0.3.2 tree / unit files | **Yes** |
+| 5 | Install 0.3.3 tree / unit files | **Yes** |
 | 6 | Optional: set `ORCA_BRIDGE_WORKER_ISOLATION=1` (+ worker install) | **Yes** |
 | 7 | Start bridge | starting here |
 | 8 | Verify health | No (running) |
@@ -91,28 +108,30 @@ racing read→sign→write — so migration runs only with the **bridge stopped*
    sudo systemctl stop orca-bridge.service
    ```
 
-3. **Migrator dry-run** as the **bridge uid** (reads only; must see would-sign or already-signed/missing):
+3. **Migrator dry-run** as the **bridge uid** (reads only; must see would-sign or already-signed/missing).
+   `sudo -u orca` does **not** attach supplementary group `orca-bridge-signer`,
+   so `connect(2)` on the 0660 socket always returns `EACCES`. Use `setpriv`:
    ```bash
-   sudo -u orca -E env \
-     HOME=/home/orca \
-     ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock \
-     node /path/to/orca-mcp/scripts/migrate-store-signatures.mjs --dry-run
+   setpriv --reuid=orca --regid=orca --groups orca-bridge-signer \
+     env HOME=/home/orca \
+         ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock \
+     node /opt/orca-mcp/scripts/migrate-store-signatures.mjs --dry-run
    ```
 
 4. **Migrator apply** (backs up each original to `*.pre-sign-<stamp>.bak`, then signs):
    ```bash
-   sudo -u orca -E env \
-     HOME=/home/orca \
-     ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock \
-     node /path/to/orca-mcp/scripts/migrate-store-signatures.mjs
+   setpriv --reuid=orca --regid=orca --groups orca-bridge-signer \
+     env HOME=/home/orca \
+         ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock \
+     node /opt/orca-mcp/scripts/migrate-store-signatures.mjs
    # safe to re-run: second pass is already-signed no-op
    ```
    If the signer socket is down the CLI exits **non-zero** with a clear message
    (never silent no-op).
 
-5. **Install 0.3.2** tree + bridge unit (still stopped):
+5. **Install 0.3.3** tree + bridge unit (still stopped):
    ```bash
-   # copy/checkout 0.3.2 into /opt/orca-mcp (or your install root)
+   # copy/checkout 0.3.3 into /opt/orca-mcp (MUST be outside /home)
    sudo install -m 644 deploy/linux/orca-bridge.service /etc/systemd/system/orca-bridge.service
    # EnvironmentFile=/etc/orca-mcp/env must include:
    #   ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock
@@ -145,7 +164,7 @@ racing read→sign→write — so migration runs only with the **bridge stopped*
    ```
 
 8. **Verify health** (coordinator / `action=health` verbose):
-   - `versionOk` — bridge reports the installed 0.3.2 tree
+   - `versionOk` — bridge reports the installed 0.3.3 tree
    - `statusProbe.ok`
    - `senderTerminal.ok` — **proves pins survived**; if this is false after cutover,
      the migrator did not run or the wrong HOME was migrated
@@ -155,8 +174,14 @@ racing read→sign→write — so migration runs only with the **bridge stopped*
 ### Migrator invocation (reference)
 
 ```bash
-node scripts/migrate-store-signatures.mjs [--dry-run] [--home DIR] [--audit-dir DIR]
+# Working invocation — join orca-bridge-signer so the 0660 socket is writable.
+setpriv --reuid=orca --regid=orca --groups orca-bridge-signer \
+  env HOME=/home/orca \
+      ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock \
+  node /opt/orca-mcp/scripts/migrate-store-signatures.mjs [--dry-run] [--home DIR] [--audit-dir DIR]
 ```
+
+`sudo -u orca …` is **not** a working path (always `EACCES` on the signer socket).
 
 Touches **only**:
 

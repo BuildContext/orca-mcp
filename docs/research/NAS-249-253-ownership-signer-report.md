@@ -37,7 +37,9 @@ Nothing is keyed on `runtimeId` — bindings survive bridge and runtime restarts
 2. **Socket path** `/run/orca-bridge/store-signer.sock` lives in  
    `RuntimeDirectory=orca-bridge` mode **`0750`**, group `orca-bridge-signer`.
 3. **Socket mode `0660`**, owner = signer uid, group = `orca-bridge-signer`  
-   (`ExecStartPost=chmod 0660` + `chgrp orca-bridge-signer`).
+   (daemon `chmodSync(0o660)` after `listen()`; **0.3.3 / NAS-257** dropped
+   `ExecStartPost=chmod/chgrp` — those raced `Type=simple` and never let the
+   unit start).
 4. **Bridge unit only:** `SupplementaryGroups=orca-bridge-signer` so the bridge  
    process can open the socket. **Worker uids are not members of that group**,  
    so `connect(2)` fails with `EACCES` even if a worker knows the path.

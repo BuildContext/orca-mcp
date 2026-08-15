@@ -534,6 +534,11 @@ sudo -u orca git clone https://github.com/BuildContext/orca-mcp.git /opt/orca-mc
 # zero runtime dependencies — nothing to npm install
 ```
 
+The shipped signer unit (`deploy/linux/orca-bridge-store-signer.service`) has
+`WorkingDirectory=/opt/orca-mcp` and `ProtectHome=true`. **Install root must
+stay outside `/home`** — a checkout under `/home/...` fails with
+`status=200/CHDIR`. Do not weaken `ProtectHome` to work around that.
+
 `ExecStart=/usr/bin/node /opt/orca-mcp/server.mjs --port 8787`
 
 **B. Global npm install** (root-owned binary, shared across accounts):

@@ -14,8 +14,11 @@ User=orca-bridge-signer
 Group=orca-bridge-signer
 # Bridge processes join SupplementaryGroups=orca-bridge-signer so they can open
 # the 0660 socket. Worker uids must NOT be in that group — that is how the
-# socket is closed off from workers (see also SocketMode / chmod 0660 below).
+# socket is closed off from workers. The daemon chmodSync(0o660)s the socket
+# after listen() (see scripts/store-signer-daemon.mjs).
 SupplementaryGroups=
+# MUST stay outside /home. ProtectHome=true makes a /home/... working
+# directory fail with status=200/CHDIR. Shipped path is /opt/orca-mcp.
 WorkingDirectory=/opt/orca-mcp
 # Runtime dir for the unix socket. Mode 0750, group orca-bridge-signer:
 # only the signer uid and members of that group can traverse /run/orca-bridge.
@@ -28,18 +31,17 @@ Environment=ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock
 Environment=ORCA_BRIDGE_STORE_SIGNER_KEY_FILE=/var/lib/orca-bridge-signer/hmac.key
 # Prefer checkout install; swap for global bin if needed.
 ExecStart=/usr/bin/node /opt/orca-mcp/scripts/store-signer-daemon.mjs
-# After start, enforce socket mode 0660 (owner=signer, group=orca-bridge-signer).
-# UMask leaves group write; chmod is belt-and-suspenders if the daemon's own
-# chmod races with a client connect.
-ExecStartPost=/usr/bin/chmod 0660 /run/orca-bridge/store-signer.sock
-# Ensure the bridge group owns the socket group bit even if the daemon umask differs.
-ExecStartPost=/usr/bin/chgrp orca-bridge-signer /run/orca-bridge/store-signer.sock
+# Socket mode 0660 is set by the daemon itself (chmodSync after listen()).
+# Do NOT add ExecStartPost=chmod/chgrp: Type=simple runs ExecStartPost
+# immediately after fork, before async listen() creates the socket (ENOENT
+# restart loop — NAS-257). Group is the unit's Group= (signer:signer).
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=orca-bridge-store-signer
 Restart=always
 RestartSec=2
 # Hardening — key must never leave this unit's filesystem view.
+# Do not weaken these settings to paper over a CHDIR/install-root mistake.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
