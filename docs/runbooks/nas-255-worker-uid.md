@@ -7,8 +7,9 @@
 | Done | Not done |
 | --- | --- |
 | ONE system user for all dispatched workers (`orca-worker` by default) | Per-dispatch uid |
-| Worker cannot read/write bridge secrets (tokens, sender-pins, audit, ownership store) or the Orca runtime/daemon token | Worker-to-worker isolation |
+| Worker cannot read/write bridge secrets (tokens, sender-pins, audit, ownership store) or the Orca runtime/daemon token | Per-dispatch uid |
 | With argv gate disabled, catalogue attacks that need same-uid trust do not pass **as the worker** | Replacing the argv/ownership gate (it becomes second echelon) |
+| Per-worktree ACL + immutable gitdir pointer; 997 commits named paths | Recursive default ACL on all `workspaces/` |
 | Coordinator paths (dispatch inject, await, release, terminal read/close/send via bridge) stay on the bridge uid | Automatic Mac cutover |
 
 **Submit input with `--enter`. There is no `--submit` flag.**
@@ -20,7 +21,7 @@ harmless on a shell). Stuck TUI: `--interrupt` on the same command.
 `orchestration dispatch --inject` types the brief only; the bridge follows
 with `terminal send --enter` to submit it.
 
-State this plainly in tickets and reports: **per-dispatch uid / worker-to-worker isolation is NOT shipped.**
+State this plainly in tickets and reports: **per-dispatch uid is NOT shipped.** Worker-to-worker isolation is **ACL-narrowed** (one checkout at a time), not uid-split.
 
 ## Why
 
@@ -47,7 +48,7 @@ Every finding in the NAS-248 line reduces to single-uid trust: the worker *is* t
 - **Bridge process** stays `User=orca` / `Group=orca`. State stays under that HOME.
 - **Agent launch** no longer uses `worktree create --agent` when isolation is on (that would spawn as orca). Flow: bare `worktree create` → `terminal create --command <wrapper> <agent>`.
 - **Wrapper** (`deploy/linux/orca-omp-as-worker.sh`) strips bridge secrets from env and `sudo -n -u orca-worker` (or root `setpriv`) execs the real agent.
-- **No shared unix group** between bridge and worker for secret paths. Repo/worktree access via **ACLs** on tree roots, not a shared group.
+- **No shared unix group** between bridge and worker for secret paths. Repo/worktree access via **per-checkout ACL at dispatch**, not a default ACL on `workspaces/` and not a shared group. Never add `orca-worker` to group `orca`. Never `setfacl -R` on `.git`.
 - **Runtime token** (`~/.config/orca/orca-runtime.json`, daemon token) stays 0600 bridge-owned. Workers do not get it. Coordinator inject/release/terminal ops run inside the bridge (bridge uid) and keep working. Worker→mailbox signals use a bridge-minted **HMAC capability** (`ORCA_WORKER_CAPABILITY`); full capability→runtime relay is part of attended cutover.
 
 ## Linux VM cutover (attended) — 0.3.3 full order
@@ -157,8 +158,9 @@ racing read→sign→write — so migration runs only with the **bridge stopped*
    #   ORCA_BRIDGE_WORKER_ISOLATION=1
    #   ORCA_BRIDGE_WORKER_HMAC_SECRET=<hex>
    # merge other keys from /etc/orca-mcp/worker-isolation.env
-   setfacl -R -m u:orca-worker:rwx /home/orca/orca/workspaces
-   setfacl -R -d -m u:orca-worker:rwx /home/orca/orca/workspaces
+   setfacl -R -x u:orca-worker /home/orca/orca/workspaces
+   setfacl -k /home/orca/orca/workspaces
+   # per-tree grants happen at isolated dispatch (do not re-apply a default ACL here)
    # Prove FS denial before enabling:
    sudo -u orca-worker cat /home/orca/.orca-bridge-tokens.json          # must fail
    sudo -u orca-worker cat /home/orca/.orca-bridge-sender-pins.json      # must fail
@@ -222,11 +224,13 @@ already applied) and you are enabling NAS-255 later.
    #   ORCA_BRIDGE_WORKER_HMAC_SECRET=<hex>
    # merge other keys from /etc/orca-mcp/worker-isolation.env
    ```
-3. **Repo/worktree ACLs** (example — adjust roots):
+3. **Repo/worktree ACLs** — strip the old recursive+default grant, then let dispatch grant per tree:
    ```bash
-   setfacl -R -m u:orca-worker:rwx /home/orca/orca/workspaces
-   setfacl -R -d -m u:orca-worker:rwx /home/orca/orca/workspaces
-   # git objects: ensure worker can read the main repo + write worktrees
+   setfacl -R -x u:orca-worker /home/orca/orca/workspaces
+   setfacl -k /home/orca/orca/workspaces
+   # dispatch applies: setfacl -m u:orca-worker:rwx <checkout>
+   #                  setfacl -d -m u:orca-worker:rwx <checkout>
+   #                  (never on parent workspaces/; never recursive on .git)
    ```
 4. **Prove FS denial before enabling**
    ```bash
@@ -242,9 +246,49 @@ already applied) and you are enabling NAS-255 later.
    ```
 6. **Smoke**
    - `action=health` verbose → `isolation.workerUid.enabled === true`, `perDispatchUid === false`
-   - Dispatch a throwaway worker; on the host: `ps -o user,pid,cmd -C omp` shows `orca-worker`
+   - Dispatch a throwaway worker; on the host: `ps -o user,pid,cmd -C grok` (or omp) shows `orca-worker`
    - From that worker uid: secret cats still fail
-   - Coordinator await → worker_done → release still works
+   - Coordinator path: **dispatch → worker_done → release** (not only "secrets unreadable")
+   - Isolated `agent: omp` that lands in bash must return `stage: agent-tui` / `fake_worker_done`, never a successful template `worker_done`
+   - Release close is `terminal close --terminal <handle> --json` (no `--tab`); `tab_not_found` is already gone
+
+## Commit model (994 write / 997 commit)
+
+uid **994** may write checkout files. uid **997** commits. Do not add 994 to group `orca`. Do not run git hooks as 997 by letting 994 replace `.git`.
+
+After isolated worktree create the bridge:
+
+1. Asserts `checkout/.git` is a regular file whose contents are exactly `gitdir: <abs-repo>/.git/worktrees/<name>`
+2. Strips the worker named ACL from `.git`, `chmod 0444` the pointer, `chmod 1775` (sticky) the checkout
+3. Grants `u:orca-worker:rwx` (named + default) on that checkout only
+
+Coordinator recipe (library: `lib/isolated-git.mjs` `commitNamedPaths`):
+
+```text
+assertSafeGitdir(checkout, expectedGitdir)
+git -C checkout add -- <named paths only>
+git -C checkout diff --cached          # returned to the caller
+git -C checkout -c user.name=… -c user.email=… commit -m <msg>
+```
+
+Refuse an empty path list, `.git`, `..`, absolute paths outside the checkout, `git add -A` / `.` / `*`. Hostile *file content* that 997 then commits is an accepted residual.
+
+## Signed stores (v2) on deploy
+
+0.3.6 verifies **only** envelope `v: 2` with integer `n` / `ts`. A 997 principal who restores an older file with a still-valid MAC is rejected as `stale`.
+
+**Before starting a 0.3.6 bridge** (bridge **stopped**): re-run the migrator so existing v1 envelopes are re-signed as v2. Runtime load does **not** auto-migrate.
+
+```bash
+sudo systemctl stop orca-bridge.service
+setpriv --reuid=orca --regid=orca --groups orca-bridge-signer \
+  env HOME=/home/orca \
+      ORCA_BRIDGE_STORE_SIGNER_SOCKET=/run/orca-bridge/store-signer.sock \
+  node /opt/orca-mcp/scripts/migrate-store-signatures.mjs
+# then start 0.3.6
+```
+
+Do not run this on a live box from this closeout — it is a deploy step for the owner.
 
 Rollback: set `ORCA_BRIDGE_WORKER_ISOLATION=0` (or remove), restart bridge; agents return to same-uid launch. Leave the `orca-worker` account in place.
 
@@ -279,7 +323,6 @@ npm test   # includes lib/worker-isolation.test.mjs
 - PRE-FIX baseline assertion: same uid ⇒ catalogue attacks still pass  
 - Optional live disposable `useradd` + `setpriv` proof under an isolated HOME (never writes live `~/.orca-bridge*`)
 
-## Follow-up ticket (file as separate)
+## Follow-up (explicitly unshipped)
 
-**Title:** Per-dispatch worker uid / worker-to-worker isolation  
-**Body must state:** NAS-255 shipped one shared `orca-worker` uid only. Worker-to-worker filesystem and process isolation is **not** done; a hostile worker can still affect sibling workers’ worktrees if ACLs grant shared write.
+Per-dispatch / DynamicUser uids stay **unshipped**. NAS-259 closed as per-worktree ACL, not a uid pool. `perDispatchUid` remains `false`.

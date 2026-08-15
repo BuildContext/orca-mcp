@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.6 — 2026-08-15
+
+### Added
+
+- **Per-worktree ACL (NAS-259 variant 2).** Isolated `worktree create` now
+  grants `u:orca-worker:rwx` (named + default) on that checkout only.
+  The parent `workspaces/` directory is never granted. The installer no
+  longer prints a recursive+default ACL on all workspaces; it prints the
+  one-shot strip (`setfacl -R -x` + `setfacl -k`) and the per-tree recipe.
+  `perDispatchUid` stays `false`. Worker-to-worker isolation is
+  ACL-narrowed, not uid-split.
+
+- **Gitdir pointer guard (NAS-266).** `assertSafeGitdir` requires
+  checkout `.git` to be a regular file whose contents are exactly
+  `gitdir: <abs-expected>`. Directories, symlinks, extra lines,
+  `includeIf`, and relative gitdirs are rejected. Harden strips the
+  worker named ACL from `.git`, `chmod 0444`s the pointer, and
+  `chmod 1775` (sticky) the checkout so uid 994 cannot unlink a
+  bridge-owned pointer.
+
+- **997 commit helper (NAS-262).** `commitNamedPaths` asserts the gitdir,
+  `git add --` named paths only, returns `git diff --cached`, then
+  commits as the bridge uid. Empty lists, `.git`, checkout escapes, and
+  `git add -A` / `.` / `*` are refused. Hostile file *content* that 997
+  then commits is an accepted residual.
+
+- **Agent TUI gate + template `worker_done` reject (NAS-267).** Isolated
+  dispatch snapshots after `tui-idle` and fails `stage: agent-tui` when
+  the pane is a shell or the wrapper seed log. `summarizeMessages` sets
+  `status: fake_worker_done` (never `next.action=release`) when the
+  contract template is still in the message. `/worker/orch` rejects with
+  `template_worker_done`. The recovery prompt example is commented so a
+  shell cannot execute it. omp launch now passes `--auto-approve`.
+
+- **Signed envelope v2 freshness (NAS-268).** Envelopes are
+  `{ v:2, alg, n, ts, payload, sig }`. The MAC covers
+  `{ n, ts, payload }`. The signer holds a monotonic `n` per store id
+  (`store-seq.json`, 0600). `n < last` is `stale`. Runtime verify
+  fail-closes on v1 and on missing `n`/`ts`. The migrator re-signs a
+  valid v1 envelope as v2 with the bridge stopped; boot does not
+  auto-migrate.
+
+### Fixed
+
+- **Release close without `--tab` (NAS-261).** The bridge `release`
+  fallback is `terminal close --terminal <handle> --json`.
+  `tab_not_found` and `workspace_session_unavailable` are treated as
+  already gone (`ok: true`, `already_gone: true`); credential purge
+  still runs. Coordinators may still pass `--tab` on `action=cli`.
+
 ## 0.3.5 — 2026-08-15
 
 ### Fixed

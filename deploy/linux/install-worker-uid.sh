@@ -132,12 +132,14 @@ else
   visudo -cf "${SEED_SUDOERS_DST}"
 fi
 
-# 4) worktree / repo access without shared group:
-#    ACL on worktree roots (operator chooses paths). Example only — not applied:
-echo "install-worker-uid: grant repo/worktree access with ACLs (example, not auto-applied):"
-echo "  setfacl -R -m u:${WORKER_USER}:rwx /home/${BRIDGE_USER}/orca/workspaces"
-echo "  setfacl -R -d -m u:${WORKER_USER}:rwx /home/${BRIDGE_USER}/orca/workspaces"
-echo "  # Prefer per-tree ACLs over a shared unix group."
+# 4) worktree access is per-checkout ACL at dispatch (NAS-259 variant 2).
+#    Do NOT grant a default ACL on the parent workspaces/ directory.
+#    One-shot strip of the old recursive+default grant (if a previous install applied it):
+echo "install-worker-uid: strip any legacy recursive ACL on all workspaces, then let dispatch grant per-tree:"
+echo "  setfacl -R -x u:${WORKER_USER} /home/${BRIDGE_USER}/orca/workspaces"
+echo "  setfacl -k /home/${BRIDGE_USER}/orca/workspaces"
+echo "  # per-tree: setfacl -m u:${WORKER_USER}:rwx <checkout> && setfacl -d -m u:${WORKER_USER}:rwx <checkout>"
+echo "  # never setfacl -R the parent; never setfacl -R .git / the shared repo gitdir"
 
 # 5) env fragment for the unit (does not write secrets)
 ENV_HINT="/etc/orca-mcp/worker-isolation.env"

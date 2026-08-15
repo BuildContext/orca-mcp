@@ -127,6 +127,19 @@ if [[ "${REAL_AGENT}" == "grok" ]]; then
     AGENT_EXTRA+=(--permission-mode bypassPermissions)
   fi
 fi
+if [[ "${REAL_AGENT}" == "omp" ]]; then
+  # omp 17.x: --auto-approve skips tool-approval prompts (closest to grok bypassPermissions).
+  # There is no skip-setup / non-interactive TUI flag; the TUI gate is the closer.
+  has_aa=0
+  for a in "$@"; do
+    if [[ "${a}" == "--auto-approve" || "${a}" == "--approval-mode" ]]; then
+      has_aa=1
+    fi
+  done
+  if [[ "${has_aa}" -eq 0 ]]; then
+    AGENT_EXTRA+=(--auto-approve)
+  fi
+fi
 
 # Prefer setpriv (util-linux) — no sudo tty; falls back to sudo -u.
 if command -v setpriv >/dev/null 2>&1 && [[ "$(id -u)" -eq 0 ]]; then

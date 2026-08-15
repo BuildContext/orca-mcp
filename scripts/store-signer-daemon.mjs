@@ -57,7 +57,9 @@ function loadOrCreateKey() {
 }
 
 const key = loadOrCreateKey();
-const { server } = createSignerDaemon({ key, socketPath });
+const seqPath = (process.env.ORCA_BRIDGE_STORE_SIGNER_SEQ || '').trim()
+  || path.join(path.dirname(keyFile), 'store-seq.json');
+const { server } = createSignerDaemon({ key, socketPath, seqPath });
 
 server.on('listening', () => {
   try {

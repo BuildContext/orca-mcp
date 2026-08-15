@@ -368,6 +368,7 @@ Runtime/version gates run **lazily** inside `dispatch` / `await` / `release` (se
 | question | Reply via `cli` → `orchestration reply`, then await + ack |
 | escalation | Reply via `cli` → `orchestration reply` (dual-routes onto `dispatch:<id>`), then await + ack; prefer `ask` for back-and-forth |
 | worker_done | `release` with `dispatchId` + worker `terminalHandle` |
+| fake_worker_done | Template `worker_done` rejected — diagnose, do not release as success |
 
 Full discipline: tool description, `action=guide`, and [`COORDINATOR.md`](./COORDINATOR.md).
 

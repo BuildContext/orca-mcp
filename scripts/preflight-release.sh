@@ -67,7 +67,10 @@ fi
 # ── pack dry-run (content hygiene) ────────────────────────────────────────
 # prepack already runs test+lint+docs; dry-run re-runs them — acceptable.
 if npm pack --dry-run >/tmp/orca-preflight-pack.log 2>&1; then
-  if grep -E '\.env($|\.)|node_modules|\.orca-bridge|id_rsa|\.pem($|\.)' /tmp/orca-preflight-pack.log; then
+  # Only the packed file listing (npm notice …). prepack runs tests; TAP
+  # lines that mention ~/.orca-bridge* must not fail the content check.
+  if grep -E 'npm notice' /tmp/orca-preflight-pack.log \
+      | grep -E '\.env($|\.)|node_modules|\.orca-bridge|id_rsa|\.pem($|\.)'; then
     fail "npm pack listing contains forbidden paths"
   else
     files=$(grep -cE 'npm notice [0-9]' /tmp/orca-preflight-pack.log || true)
@@ -90,7 +93,7 @@ SCRUB_EXCLUDE=(
   ':(exclude).gitignore'
 )
 # Public ID schemes that match the generic tracker token shape — not scrub hits.
-SCRUB_PUBLIC_ID_RE='^(CVE|CWE|SHA|UTF|RFC|ISO|IEC|HTML|HTTP|HTTPS|JSON|TLS|TCP|UDP|PNG|SVG|CSS|XML|AWS|GCP)-'
+SCRUB_PUBLIC_ID_RE='^(CVE|CWE|SHA|UTF|RFC|ISO|IEC|HTML|HTTP|HTTPS|JSON|TLS|TCP|UDP|PNG|SVG|CSS|XML|AWS|GCP|NAS|GHSA|ISSUE)-'
 
 SCRUB_PATTERNS=()
 # Cyrillic (often accidental local-language leaks in an English-primary tree)
@@ -151,7 +154,7 @@ const fs = require('fs');
 const scrubRe = new RegExp(process.env.SCRUB_RE, 'g');
 const publicId = new RegExp(process.env.SCRUB_PUBLIC_ID_RE);
 const raw = fs.readFileSync('/tmp/orca-preflight-scrub.raw', 'utf8');
-for (const line of raw.split(/\n')) {
+for (const line of raw.split(/\n/)) {
   if (!line) continue;
   // git grep -nI → path:line:content — blank public IDs in the content only
   const m = line.match(/^(.*?:\d+:)(.*)$/);
