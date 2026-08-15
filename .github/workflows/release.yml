@@ -61,8 +61,10 @@ jobs:
       - name: Pack dry-run
         run: |
           npm pack --dry-run 2>&1 | tee /tmp/pack-dry.txt
-          # Fail closed if anything secret-looking lands in the tarball listing.
-          if grep -E '\.env($|\.)|node_modules|\.orca-bridge|id_rsa|\.pem($|\.)' /tmp/pack-dry.txt; then
+          # Only the packed file listing. prepack runs tests; TAP lines that
+          # mention ~/.orca-bridge* must not fail the content check.
+          if grep -E 'npm notice' /tmp/pack-dry.txt \
+              | grep -E '\.env($|\.)|node_modules|\.orca-bridge|id_rsa|\.pem($|\.)'; then
             echo "::error::pack listing contains forbidden paths"
             exit 1
           fi
