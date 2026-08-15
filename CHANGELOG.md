@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.5 — 2026-08-15
+
+### Fixed
+
+- **`--submit` never existed.** Orca's CLI has no `--submit` flag on any
+  command (`grep -c submit` on shipped `args.js` is 0). Passing it is
+  `invalid_argument` from the CLI. The real `terminal send` submit
+  affordance is **`--enter`** ("Append Enter after sending text");
+  `--interrupt` breaks a stuck TUI. `--enter` was already classified
+  (`FLAG_TABLE` / `NON_TARGET_FLAGS`, `BOOLEAN_FLAGS`, and the
+  `terminal send` exact-form allowlist) and needs no policy carve-out.
+- Remove the 0.3.3 `POLICY_SCOPED_BOOLEAN_FLAGS` hook that whitelisted a
+  phantom `--submit` on `terminal send`. Unknown flags stay fail-closed.
+- Bridge dispatch no longer types-without-submit. Runtime
+  `orchestration dispatch --inject` cannot express Enter; after it types
+  the brief the bridge sends `terminal send --enter` (`dispatch-inject-enter`).
+  Submit is target-dependent: a **shell** target submits on the first
+  `--enter`; a **Grok TUI compose box** needs the text send plus a
+  following empty `--enter` (verified live 2026-08-15 — a single
+  `--text … --enter` left the brief in the draft buffer). Inject
+  recovery and isolated preamble therefore emit that two-send sequence.
+  The extra empty `--enter` is harmless on a shell that already submitted.
+  `injected:true` is still whatever the runtime envelope reports — do
+  not force it. There is no `--submit`.
+
 ## 0.3.4 — 2026-08-15
 
 ### Added

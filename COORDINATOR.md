@@ -28,7 +28,7 @@ next.action is a **hint**. Prefer summary.status when they disagree. On empty wi
 
 - Escalate when `liveness=stalled` (default: ≥ **8** empty ~45s windows, or ~**8 min** without activity).
 - Hard ceiling ~**15 min** without progress → release with diagnostics and report to owner.
-- Protocol: `check`/`cli` peek → optional worker ping → release + owner report. Do **not** infinite-loop `await` on empty.
+- Protocol: `check`/`cli` peek → optional worker ping (`terminal send --enter`; `--interrupt` if stuck) → release + owner report. Do **not** infinite-loop `await` on empty.
 
 ## Waves
 
@@ -67,7 +67,7 @@ The bridge **appends** a `worker_done` contract itself. Still spell out in the b
 
 - orchestration reply (questions)
 - skills get, status, worktree show/list
-- terminal list/read/close for YOUR keep-list handles only
+- terminal list/read/close/send for YOUR keep-list handles only (shell: one `--text … --enter`; TUI compose box: that plus a following empty `--enter`; `--interrupt` to break a stuck TUI; no `--submit`)
 - worker-show / worker-read on escalation
 
 Not allowed:

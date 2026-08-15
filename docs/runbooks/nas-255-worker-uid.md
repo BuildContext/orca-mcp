@@ -11,6 +11,15 @@
 | With argv gate disabled, catalogue attacks that need same-uid trust do not pass **as the worker** | Replacing the argv/ownership gate (it becomes second echelon) |
 | Coordinator paths (dispatch inject, await, release, terminal read/close/send via bridge) stay on the bridge uid | Automatic Mac cutover |
 
+**Submit input with `--enter`. There is no `--submit` flag.**
+A **shell** target submits on one
+`orca-ide terminal send --terminal <owned> --text '…' --enter`.
+A **TUI compose box** (Grok draft buffer) needs that text send plus a
+following empty `--enter` (verified live 2026-08-15; the extra send is
+harmless on a shell). Stuck TUI: `--interrupt` on the same command.
+`orchestration dispatch --inject` types the brief only; the bridge follows
+with `terminal send --enter` to submit it.
+
 State this plainly in tickets and reports: **per-dispatch uid / worker-to-worker isolation is NOT shipped.**
 
 ## Why

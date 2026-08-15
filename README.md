@@ -385,6 +385,28 @@ Example wave:
 ```
 <!-- END GENERATED: coordinator-discipline -->
 
+### Terminal send — submit with `--enter`
+
+`orca-ide terminal send` signature is
+`[--terminal <handle>] [--text <text>] [--enter] [--interrupt] [--json]`.
+`--enter` appends Enter after the text. There is no `--submit` flag on any
+Orca command (passing it is `invalid_argument` from the CLI and
+`cli_policy_denied` / unclassified from the bridge). Submit is
+**target-dependent**:
+
+- **Shell target:** one `terminal send --terminal <owned> --text '…' --enter --json` submits.
+- **TUI compose box** (Grok draft buffer): that text send plus a following
+  empty `terminal send --terminal <owned> --text '' --enter --json`.
+  Verified live 2026-08-15 — a single `--text … --enter` left the brief
+  sitting in the box; only the subsequent empty `--enter` submitted it.
+  The extra send is harmless on a shell that already submitted.
+- Submit a compose box that `dispatch --inject` already typed:
+  `terminal send --terminal <owned> --enter --json`
+- Stuck-worker TUI: `terminal send --terminal <owned> --interrupt --json`
+
+`--enter` is already on the exact-form allowlist for `terminal send`. Ownership
+still fails closed (`handle_not_owned` on a foreign handle).
+
 ---
 
 ## Environment
