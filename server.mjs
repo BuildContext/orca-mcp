@@ -151,7 +151,14 @@ import {
   authorizeWorkerOrch,
   getArgFlag,
 } from './lib/worker-orch-relay.mjs';
-import { looksLikeAgentTui, isTemplateWorkerDone } from './lib/agent-tui.mjs';
+import { looksLikeAgentTui } from './lib/agent-tui.mjs';
+import { summarizeMessages, nextStepForAwait, REJECTED_WORKER_DONE } from './lib/await-summary.mjs';
+import {
+  planAwaitBindAndAck,
+  decideStaleAckAction,
+  withAbortableLock,
+  bindHttpRequestAbort,
+} from './lib/await-lifecycle.mjs';
 import { hardenIsolatedWorktree, inferExpectedGitdir } from './lib/worktree-acl.mjs';
 
 const execFile = promisify(execFileCb);
@@ -297,6 +304,10 @@ const SENDER_CACHE_TTL_MS = 15_000;
 const requestContext = new AsyncLocalStorage();
 function currentClientKey() {
   return requestContext.getStore()?.clientKey || 'default';
+}
+
+function currentRequestSignal() {
+  return requestContext.getStore()?.signal;
 }
 
 /** @type {Map<string, { handle: string, at: number, source: string, title?: string }>} */
@@ -568,6 +579,12 @@ async function loadPersistedOwnership() {
         dispatchedAt: b.dispatchedAt || null,
         lastActivityAt: b.lastActivityAt || b.dispatchedAt || null,
         source: 'persisted',
+        ...(b.workerIsolation === true || b.workerIsolation === false
+          ? { workerIsolation: b.workerIsolation }
+          : {}),
+        ...(b.workerCapabilityMinted === true || b.workerCapabilityMinted === false
+          ? { workerCapabilityMinted: b.workerCapabilityMinted }
+          : {}),
       });
       if (!bound.ok) continue;
       registerOwnedDispatch({
@@ -805,12 +822,13 @@ function orcaBinary() {
 // --- CLI transport: runOrcaCli contract from orca_terminal.mjs --------------
 // Never throws on non-zero exit; failed spawn is spawnError (error.code string),
 // CLI exit is a number. See docs/design.md#envelope-parsing-quirks.
-async function runOrca(args, { timeoutMs = DEFAULT_TIMEOUT_MS, cwd } = {}) {
+async function runOrca(args, { timeoutMs = DEFAULT_TIMEOUT_MS, cwd, signal = currentRequestSignal() } = {}) {
   try {
     const { stdout, stderr } = await execFile(orcaBinary(), args, {
       timeout: Math.min(timeoutMs, MAX_TIMEOUT_MS),
       maxBuffer: MAX_BUFFER,
       cwd: cwd || process.env.HOME,
+      signal,
     });
     return { code: 0, stdout: stdout || '', stderr: stderr || '' };
   } catch (error) {
@@ -981,146 +999,6 @@ function pick(obj, ...keys) {
 }
 function msgType(m) {
   return String(pick(m, 'type', 'messageType', 'kind') || '').toLowerCase();
-}
-function summarizeMessages(messages = []) {
-  const list = Array.isArray(messages) ? messages : [];
-  const byType = {};
-  for (const m of list) {
-    const t = msgType(m) || 'unknown';
-    byType[t] = (byType[t] || 0) + 1;
-  }
-  const done = list.find((m) => msgType(m) === 'worker_done');
-  const question = list.find((m) => msgType(m) === 'question');
-  const escalation = list.find((m) => msgType(m) === 'escalation');
-  const extractDone = (m) => {
-    if (!m) return null;
-    const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
-    return {
-      taskId: pick(m, 'taskId', 'task_id') || pick(payload, 'taskId', 'task_id'),
-      dispatchId: pick(m, 'dispatchId', 'dispatch_id') || pick(payload, 'dispatchId', 'dispatch_id'),
-      outcome: pick(m, 'outcome') || pick(payload, 'outcome'),
-      subject: pick(m, 'subject', 'title'),
-      body: pick(m, 'body', 'text', 'content'),
-      filesModified: pick(m, 'filesModified', 'files_modified') || pick(payload, 'filesModified', 'files_modified'),
-      reportPath: pick(m, 'reportPath', 'report_path') || pick(payload, 'reportPath', 'report_path'),
-      id: pick(m, 'id', 'messageId', 'message_id'),
-    };
-  };
-
-  const extractedDone = extractDone(done);
-  let primary = 'empty';
-  let rejectedWorkerDone = undefined;
-  if (done) {
-    if (isTemplateWorkerDone({
-      subject: extractedDone?.subject,
-      body: extractedDone?.body,
-      filesModified: extractedDone?.filesModified,
-      payload: done.payload,
-    })) {
-      primary = 'fake_worker_done';
-      rejectedWorkerDone = 'template';
-    } else {
-      primary = 'worker_done';
-    }
-  } else if (escalation) primary = 'escalation';
-  else if (question) primary = 'question';
-  else if (list.length) primary = 'messages';
-
-  return {
-    status: primary,
-    counts: byType,
-    rejected_worker_done: rejectedWorkerDone,
-    worker_done: extractedDone,
-    question: question
-      ? {
-          id: pick(question, 'id', 'messageId', 'message_id'),
-          subject: pick(question, 'subject', 'title'),
-          body: pick(question, 'body', 'text', 'content'),
-          dispatchId: pick(question, 'dispatchId', 'dispatch_id'),
-        }
-      : null,
-    escalation: escalation
-      ? {
-          id: pick(escalation, 'id', 'messageId', 'message_id'),
-          subject: pick(escalation, 'subject', 'title'),
-          body: pick(escalation, 'body', 'text', 'content'),
-          dispatchId: pick(escalation, 'dispatchId', 'dispatch_id'),
-        }
-      : null,
-  };
-}
-
-function nextStepForAwait(summary, { timedOut, deliveryId, livenessInfo = null } = {}) {
-  // next.action is a HINT — summary.status wins if they disagree.
-  if (summary.status === 'fake_worker_done') {
-    return {
-      action: 'diagnose_fake_worker_done',
-      detail:
-        'summary.status=fake_worker_done — template or placeholder worker_done rejected. ' +
-        'Do not release as success. Inspect the worker tab; treat as a failed agent launch.',
-      deliveryId: deliveryId || null,
-      rejected_worker_done: summary.rejected_worker_done || 'template',
-      note: 'next.action is a hint; prefer summary.status if they disagree.',
-    };
-  }
-  if (summary.status === 'worker_done') {
-    return {
-      action: 'release',
-      detail:
-        'summary.status=worker_done (authoritative). Call orca{action:"release",dispatchId,terminalHandle}. ' +
-        'Then orca{action:"await",runId,ack:deliveryId,waitMs:0} if more workers remain, else finish. ' +
-        'Report outcome+body+filesModified. Inject-path: release may mode=terminal-close (ok).',
-      deliveryId: deliveryId || null,
-      dispatchId: summary.worker_done?.dispatchId || null,
-      note: 'next.action is a hint; prefer summary.status if they disagree.',
-    };
-  }
-  if (summary.status === 'question') {
-    const qid = summary.question?.id || '<question.id>';
-    return {
-      action: 'reply_then_await',
-      detail:
-        `summary.status=question. Reply: orca{action:"cli",args:["orchestration","reply","--id","${qid}","--body","<answer>","--json"]}, ` +
-        'then orca{action:"await",runId,waitMs:45000,ack:deliveryId}.',
-      deliveryId: deliveryId || null,
-      questionId: summary.question?.id || null,
-      reply_argv: ['orchestration', 'reply', '--id', String(qid), '--body', '<answer>', '--json'],
-      note: 'next.action is a hint; prefer summary.status if they disagree.',
-    };
-  }
-  if (summary.status === 'escalation') {
-    const eid = summary.escalation?.id || '<escalation.id>';
-    return {
-      action: 'reply_then_ack',
-      detail:
-        'summary.status=escalation. Reply: orca{action:"cli",args:["orchestration","reply","--id","' +
-        eid +
-        '","--body","<answer>","--json"]} ' +
-        '(bridge dual-routes non-question replies onto dispatch:<id> so the waiting worker unblocks). ' +
-        'Then await with ack=deliveryId. Prefer ask for true back-and-forth.',
-      deliveryId: deliveryId || null,
-      escalationId: summary.escalation?.id || null,
-      reply_argv: ['orchestration', 'reply', '--id', String(eid), '--body', '<answer>', '--json'],
-      note: 'next.action is a hint; prefer summary.status if they disagree.',
-    };
-  }
-  if (timedOut || summary.status === 'empty') {
-    if (livenessInfo && livenessInfo.liveness) {
-      return nextStepForLiveness({
-        liveness: livenessInfo.liveness,
-        emptyWindowsConsecutive: livenessInfo.emptyWindowsConsecutive,
-        msSinceActivity: livenessInfo.msSinceActivity,
-        deliveryId: null,
-      });
-    }
-    return nextStepForLiveness({ liveness: 'unknown', emptyWindowsConsecutive: 0, deliveryId: null });
-  }
-  return {
-    action: 'process_messages',
-    detail: 'Other message types in raw.messages — process, then await with ack=deliveryId.',
-    deliveryId: deliveryId || null,
-    note: 'next.action is a hint; prefer summary.status if they disagree.',
-  };
 }
 
 /**
@@ -2191,7 +2069,10 @@ async function dispatchWorker(args = {}) {
     agent,
     worktree: worktreePath || null,
     name: name || null,
-    extra: { workerIsolation: isolationPlan.mode === 'isolated-command' },
+    extra: {
+      workerIsolation: isolationPlan.mode === 'isolated-command',
+      workerCapabilityMinted: Boolean(workerCapability),
+    },
   });
 
 
@@ -2248,12 +2129,8 @@ async function awaitDispatch(args = {}) {
   const sender = await resolveSenderTerminal();
 
   /**
-   * Mechanism B (0.2.13):
-   * run-use bumps consumer_generation. Deliveries (and their deliveryId for --ack)
-   * are generation-scoped. Calling run-use on every await made ack always fail with
-   * consumer_fenced even for a single coordinator.
-   * Rule: run-use only when this pin is not already bound to runId; if we rebind,
-   * drop any client-provided ack (it belongs to the previous generation).
+   * run-use bumps consumer_generation. Do not call it while consuming a
+   * delivery ack: that reopens the unacked batch under a new delivery id.
    */
   let useRes = null;
   let runUseSkipped = false;
@@ -2271,18 +2148,15 @@ async function awaitDispatch(args = {}) {
     return ok;
   }
 
-  if (isRunBound(runId, sender.handle)) {
+  const bindPlan = planAwaitBindAndAck({
+    bound: isRunBound(runId, sender.handle),
+    ack,
+  });
+  ack = bindPlan.ack;
+  if (!bindPlan.runUse) {
     runUseSkipped = true;
   } else {
-    const ok = await bindRun();
-    if (ok && ack) {
-      // Generation advanced (or first bind after restart) — prior deliveryId is invalid.
-      ackDropped = {
-        deliveryId: ack,
-        reason: 'run_rebound_or_first_bind_invalidates_prior_delivery',
-      };
-      ack = null;
-    }
+    await bindRun();
   }
 
   function buildCheckArgv(ackId) {
@@ -2324,23 +2198,34 @@ async function awaitDispatch(args = {}) {
       );
     staleInfo = null;
   } else if (staleInfo && ack) {
-    // msg_… ack or foreign/expired deliveryId — drop and retry once without ack.
-    ackDropped = {
-      deliveryId: ack,
-      reason: staleInfo.hint || 'stale_delivery',
-      detail: staleInfo.message,
-    };
-    ack = null;
-    described = await runJson(buildCheckArgv(null), { timeoutMs: waitMs + 30_000 });
-    env = described.envelope || {};
-    fence =
-      env.error?.code === 'consumer_fenced' ||
-      /consumer_fenced|not run_|fenced consumer|no longer bound/i.test(
-        String(env.error?.message || env.error?.code || ''),
-      );
-    staleInfo = staleFromDescribed(described, ackDropped.deliveryId);
-    // If retry still stale with no ack, clear — shouldn't happen without ack.
-    if (!ack) staleInfo = null;
+    const staleAction = decideStaleAckAction({
+      ackId: ack,
+      staleHint: staleInfo.hint,
+    });
+    if (staleAction === 'idempotent') {
+      // A prior successful ack can be retried after a client-side response
+      // loss. It has already consumed the batch; do not reopen it.
+      described = {
+        ok: true,
+        envelope: {
+          ok: true,
+          result: { runId, count: 0, messages: [], deliveryId: null, timedOut: false },
+        },
+      };
+      env = described.envelope;
+      staleInfo = null;
+    } else {
+      // A msg_ token is not a delivery ack; retry once without it.
+      ackDropped = {
+        deliveryId: ack,
+        reason: staleInfo.hint || 'stale_delivery',
+        detail: staleInfo.message,
+      };
+      ack = null;
+      described = await runJson(buildCheckArgv(null), { timeoutMs: waitMs + 30_000 });
+      env = described.envelope || {};
+      staleInfo = null;
+    }
   }
 
   if ((!described.envelope && described.ok === false) || fence || (env.error && isStaleDeliveryError(env.error?.code, env.error?.message))) {
@@ -2405,7 +2290,7 @@ async function awaitDispatch(args = {}) {
     pick,
   );
   const summary = summarizeMessages(messages);
-  if (summary.worker_done && !summary.worker_done.outcome) {
+  if (summary.status === 'worker_done' && summary.worker_done && !summary.worker_done.outcome) {
     try {
       const rawPayload = messages.find((m) => msgType(m) === 'worker_done')?.payload;
       const p = typeof rawPayload === 'string' ? JSON.parse(rawPayload) : rawPayload;
@@ -2516,8 +2401,8 @@ async function awaitDispatch(args = {}) {
     const t = msgType(m);
     dispatchRegistry.upsert(didStr, {
       status:
-        t === 'worker_done' && summary.status === 'fake_worker_done'
-          ? 'fake_worker_done'
+        t === 'worker_done' && (summary.status === 'fake_worker_done' || summary.status === REJECTED_WORKER_DONE)
+          ? summary.status
           : t === 'worker_done'
             ? 'worker_done'
             : (t || 'message'),
@@ -2540,7 +2425,7 @@ async function awaitDispatch(args = {}) {
       deliveryId: deliveryId || pick(m, 'deliveryId', 'delivery_id') || null,
     });
   }
-  if (summary.status !== 'fake_worker_done' && summary.worker_done?.dispatchId) {
+  if (summary.status === 'worker_done' && summary.worker_done?.dispatchId) {
     const didStr = String(summary.worker_done.dispatchId);
     if (owned.has(didStr)) {
       const existing = dispatchRegistry.get(didStr);
@@ -2910,7 +2795,12 @@ async function callTool(name, args = {}) {
   const needsOrchLock = op === 'dispatch' || op === 'await' || op === 'release' || op === 'check'
     || (op === 'cli' && Array.isArray(a.args) && a.args[0] === 'orchestration');
   if (needsOrchLock) {
-    return withClientOrchLock(currentClientKey(), () => callToolUnlocked(op, a));
+    return withAbortableLock(
+      withClientOrchLock,
+      currentClientKey(),
+      currentRequestSignal(),
+      () => callToolUnlocked(op, a),
+    );
   }
   return callToolUnlocked(op, a);
 }
@@ -3618,6 +3508,7 @@ async function handleWorkerOrchHttp(req, res) {
 
 const server = http.createServer(async (req, res) => {
   const origin = originFor(req);
+  const requestAbort = bindHttpRequestAbort(req, res);
   const preAuthPath = (req.url || '/').split('?')[0];
   logRequest(req);
 
@@ -3655,7 +3546,7 @@ const server = http.createServer(async (req, res) => {
   let sessionId = (auth.sessionId && touchSession(auth.sessionId)) ? auth.sessionId : '';
   const clientKey = auth.clientKey || 'default';
 
-  return requestContext.run({ clientKey, sessionId, authKind: auth.authKind }, async () => {
+  return requestContext.run({ clientKey, sessionId, authKind: auth.authKind, signal: requestAbort.signal }, async () => {
   if (cleanPath.startsWith('/hindsight/') || cleanPath === '/hindsight') {
     const sub = cleanPath.replace(/^\/hindsight/, '') || '/';
     log(`${req.method} hindsight${sub}`);
