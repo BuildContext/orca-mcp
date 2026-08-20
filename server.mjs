@@ -153,6 +153,12 @@ import {
 } from './lib/worker-orch-relay.mjs';
 import { looksLikeAgentTui } from './lib/agent-tui.mjs';
 import { summarizeMessages, nextStepForAwait, REJECTED_WORKER_DONE } from './lib/await-summary.mjs';
+import {
+  planAwaitBindAndAck,
+  decideStaleAckAction,
+  withAbortableLock,
+  bindHttpRequestAbort,
+} from './lib/await-lifecycle.mjs';
 import { hardenIsolatedWorktree, inferExpectedGitdir } from './lib/worktree-acl.mjs';
 
 const execFile = promisify(execFileCb);
@@ -298,6 +304,10 @@ const SENDER_CACHE_TTL_MS = 15_000;
 const requestContext = new AsyncLocalStorage();
 function currentClientKey() {
   return requestContext.getStore()?.clientKey || 'default';
+}
+
+function currentRequestSignal() {
+  return requestContext.getStore()?.signal;
 }
 
 /** @type {Map<string, { handle: string, at: number, source: string, title?: string }>} */
@@ -812,12 +822,13 @@ function orcaBinary() {
 // --- CLI transport: runOrcaCli contract from orca_terminal.mjs --------------
 // Never throws on non-zero exit; failed spawn is spawnError (error.code string),
 // CLI exit is a number. See docs/design.md#envelope-parsing-quirks.
-async function runOrca(args, { timeoutMs = DEFAULT_TIMEOUT_MS, cwd } = {}) {
+async function runOrca(args, { timeoutMs = DEFAULT_TIMEOUT_MS, cwd, signal = currentRequestSignal() } = {}) {
   try {
     const { stdout, stderr } = await execFile(orcaBinary(), args, {
       timeout: Math.min(timeoutMs, MAX_TIMEOUT_MS),
       maxBuffer: MAX_BUFFER,
       cwd: cwd || process.env.HOME,
+      signal,
     });
     return { code: 0, stdout: stdout || '', stderr: stderr || '' };
   } catch (error) {
@@ -2118,12 +2129,8 @@ async function awaitDispatch(args = {}) {
   const sender = await resolveSenderTerminal();
 
   /**
-   * Mechanism B (0.2.13):
-   * run-use bumps consumer_generation. Deliveries (and their deliveryId for --ack)
-   * are generation-scoped. Calling run-use on every await made ack always fail with
-   * consumer_fenced even for a single coordinator.
-   * Rule: run-use only when this pin is not already bound to runId; if we rebind,
-   * drop any client-provided ack (it belongs to the previous generation).
+   * run-use bumps consumer_generation. Do not call it while consuming a
+   * delivery ack: that reopens the unacked batch under a new delivery id.
    */
   let useRes = null;
   let runUseSkipped = false;
@@ -2141,18 +2148,15 @@ async function awaitDispatch(args = {}) {
     return ok;
   }
 
-  if (isRunBound(runId, sender.handle)) {
+  const bindPlan = planAwaitBindAndAck({
+    bound: isRunBound(runId, sender.handle),
+    ack,
+  });
+  ack = bindPlan.ack;
+  if (!bindPlan.runUse) {
     runUseSkipped = true;
   } else {
-    const ok = await bindRun();
-    if (ok && ack) {
-      // Generation advanced (or first bind after restart) — prior deliveryId is invalid.
-      ackDropped = {
-        deliveryId: ack,
-        reason: 'run_rebound_or_first_bind_invalidates_prior_delivery',
-      };
-      ack = null;
-    }
+    await bindRun();
   }
 
   function buildCheckArgv(ackId) {
@@ -2194,23 +2198,34 @@ async function awaitDispatch(args = {}) {
       );
     staleInfo = null;
   } else if (staleInfo && ack) {
-    // msg_… ack or foreign/expired deliveryId — drop and retry once without ack.
-    ackDropped = {
-      deliveryId: ack,
-      reason: staleInfo.hint || 'stale_delivery',
-      detail: staleInfo.message,
-    };
-    ack = null;
-    described = await runJson(buildCheckArgv(null), { timeoutMs: waitMs + 30_000 });
-    env = described.envelope || {};
-    fence =
-      env.error?.code === 'consumer_fenced' ||
-      /consumer_fenced|not run_|fenced consumer|no longer bound/i.test(
-        String(env.error?.message || env.error?.code || ''),
-      );
-    staleInfo = staleFromDescribed(described, ackDropped.deliveryId);
-    // If retry still stale with no ack, clear — shouldn't happen without ack.
-    if (!ack) staleInfo = null;
+    const staleAction = decideStaleAckAction({
+      ackId: ack,
+      staleHint: staleInfo.hint,
+    });
+    if (staleAction === 'idempotent') {
+      // A prior successful ack can be retried after a client-side response
+      // loss. It has already consumed the batch; do not reopen it.
+      described = {
+        ok: true,
+        envelope: {
+          ok: true,
+          result: { runId, count: 0, messages: [], deliveryId: null, timedOut: false },
+        },
+      };
+      env = described.envelope;
+      staleInfo = null;
+    } else {
+      // A msg_ token is not a delivery ack; retry once without it.
+      ackDropped = {
+        deliveryId: ack,
+        reason: staleInfo.hint || 'stale_delivery',
+        detail: staleInfo.message,
+      };
+      ack = null;
+      described = await runJson(buildCheckArgv(null), { timeoutMs: waitMs + 30_000 });
+      env = described.envelope || {};
+      staleInfo = null;
+    }
   }
 
   if ((!described.envelope && described.ok === false) || fence || (env.error && isStaleDeliveryError(env.error?.code, env.error?.message))) {
@@ -2780,7 +2795,12 @@ async function callTool(name, args = {}) {
   const needsOrchLock = op === 'dispatch' || op === 'await' || op === 'release' || op === 'check'
     || (op === 'cli' && Array.isArray(a.args) && a.args[0] === 'orchestration');
   if (needsOrchLock) {
-    return withClientOrchLock(currentClientKey(), () => callToolUnlocked(op, a));
+    return withAbortableLock(
+      withClientOrchLock,
+      currentClientKey(),
+      currentRequestSignal(),
+      () => callToolUnlocked(op, a),
+    );
   }
   return callToolUnlocked(op, a);
 }
@@ -3488,6 +3508,7 @@ async function handleWorkerOrchHttp(req, res) {
 
 const server = http.createServer(async (req, res) => {
   const origin = originFor(req);
+  const requestAbort = bindHttpRequestAbort(req, res);
   const preAuthPath = (req.url || '/').split('?')[0];
   logRequest(req);
 
@@ -3525,7 +3546,7 @@ const server = http.createServer(async (req, res) => {
   let sessionId = (auth.sessionId && touchSession(auth.sessionId)) ? auth.sessionId : '';
   const clientKey = auth.clientKey || 'default';
 
-  return requestContext.run({ clientKey, sessionId, authKind: auth.authKind }, async () => {
+  return requestContext.run({ clientKey, sessionId, authKind: auth.authKind, signal: requestAbort.signal }, async () => {
   if (cleanPath.startsWith('/hindsight/') || cleanPath === '/hindsight') {
     const sub = cleanPath.replace(/^\/hindsight/, '') || '/';
     log(`${req.method} hindsight${sub}`);

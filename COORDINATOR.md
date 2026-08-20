@@ -57,7 +57,7 @@ The bridge **appends** a `worker_done` contract itself. Still spell out in the b
 | --- | --- |
 | `worktree create --agent --prompt` | blocked on action=cli; no completion signal |
 | `terminal wait --for tui-idle/exit as completion` | idle ≠ done; omp rarely exits |
-| `single await waitMs > 45000 when client wrapper ~60s` | prefer 45000 and re-call; hard max 240000 |
+| `single await waitMs > 45000 when client wrapper ~60s` | prefer 45000 and re-call; hard max 45000 |
 | `success from terminal preview text` | only `worker_done` + outcome |
 | `treat template worker_done` | subject <short status>, filesModified path/a path/b) as success |
 | `treat runtime-rejected worker_done` | _orcaLifecycleRejection) as success |

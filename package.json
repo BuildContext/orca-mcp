@@ -45,6 +45,7 @@
     "lib/audit.mjs",
     "lib/cli-policy.mjs",
     "lib/coordinator-doctrine.mjs",
+    "lib/await-lifecycle.mjs",
     "lib/orch-isolation.mjs",
     "lib/security-core.mjs",
     "lib/runtime-guard.mjs",
