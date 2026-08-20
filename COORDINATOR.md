@@ -22,6 +22,7 @@ Optional diagnostics (compact default: version, versionOk, statusProbe.ok, defau
 | escalation | `cli` → `orchestration reply` (bridge dual-routes onto `dispatch:<id>`), then `await` + `ack`; prefer `orchestration ask` for back-and-forth |
 | worker_done | `release` with `dispatchId` + worker `terminalHandle`; outcome = body + filesModified |
 | fake_worker_done | Template/placeholder `worker_done` rejected — do **not** release as success; diagnose the tab |
+| rejected_worker_done | Runtime rejected `worker_done` (`_orcaLifecycleRejection`) — do **not** treat as success; original body stays on `summary.worker_done.body` |
 
 next.action is a **hint**. Prefer summary.status when they disagree. On empty windows also honor liveness (stalled → diagnose, not blind re-await).
 
@@ -59,6 +60,7 @@ The bridge **appends** a `worker_done` contract itself. Still spell out in the b
 | `single await waitMs > 45000 when client wrapper ~60s` | prefer 45000 and re-call; hard max 240000 |
 | `success from terminal preview text` | only `worker_done` + outcome |
 | `treat template worker_done` | subject <short status>, filesModified path/a path/b) as success |
+| `treat runtime-rejected worker_done` | _orcaLifecycleRejection) as success |
 | `release on timeout / empty while active|idle` | only after `worker_done` (or stalled diagnose) |
 | `health before every wave as a ritual` | use on demand; runtime errors self-diagnose |
 | `infinite await on empty when liveness=stalled` | diagnose / ping / release+report |
